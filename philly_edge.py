@@ -140,6 +140,14 @@ def model_probs_today() -> dict:
 # KALSHI AUTH (RSA-PSS)
 # -----------------------
 def load_private_key(path: str):
+    # Streamlit Cloud: private key comes from secrets/env as PEM text
+    pem = os.getenv("KALSHI_PRIVATE_KEY_PEM", "").strip()
+    if pem:
+        return serialization.load_pem_private_key(pem.encode("utf-8"), password=None)
+
+    # Local dev fallback: load from file path
+    if not path:
+        raise RuntimeError("Missing Kalshi private key. Set KALSHI_PRIVATE_KEY_PEM (recommended) or KALSHI_PRIVATE_KEY_PATH.")
     with open(path, "rb") as f:
         return serialization.load_pem_private_key(f.read(), password=None)
 
@@ -155,7 +163,7 @@ def sign_request(private_key, timestamp_ms: str, method: str, path: str) -> str:
 
 def kalshi_get(path: str, params=None) -> dict:
     key_id = os.getenv("KALSHI_KEY_ID")
-    key_path = os.environ["KALSHI_PRIVATE_KEY_PATH"].strip()
+    key_path = os.getenv("KALSHI_PRIVATE_KEY_PATH", "").strip()
     private_key = load_private_key(key_path)
 
     ts = str(int(time.time() * 1000))
