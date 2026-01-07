@@ -1,0 +1,33 @@
+name: Track performance
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Run tracker
+        env:
+          KALSHI_KEY_ID: ${{ secrets.KALSHI_KEY_ID }}
+          KALSHI_PRIVATE_KEY_PEM: ${{ secrets.KALSHI_PRIVATE_KEY_PEM }}
+        run: python track.py
+
+      - name: Commit updated performance.csv
+        run: |
+          git config user.name "kalshi-tracker-bot"
+          git config user.email "kalshi-tracker-bot@users.noreply.github.com"
+          git add data/performance.csv
+          git commit -m "Update performance tracking" || echo "No changes"
+          git push

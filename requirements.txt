@@ -1,0 +1,6 @@
+streamlit
+pandas
+requests
+cryptography
+altair
+streamlit-autorefresh
