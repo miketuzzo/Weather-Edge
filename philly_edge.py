@@ -154,7 +154,7 @@ def sign_request(private_key, timestamp_ms: str, method: str, path: str) -> str:
     return base64.b64encode(sig).decode("utf-8")
 
 def kalshi_get(path: str, params=None) -> dict:
-    key_id = os.environ["KALSHI_API_KEY_ID"].strip()
+    key_id = os.getenv("KALSHI_KEY_ID")
     key_path = os.environ["KALSHI_PRIVATE_KEY_PATH"].strip()
     private_key = load_private_key(key_path)
 
