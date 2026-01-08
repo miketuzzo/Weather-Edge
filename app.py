@@ -47,6 +47,38 @@ def value_color(v):
         return ""
     return "color: #22c55e;" if v > 0 else "color: #ef4444;"
 
+def render_overall_best_bet(lb: pd.DataFrame):
+    """Render a single global best-bet banner based on the current leaderboard."""
+    st.subheader("Overall best bet (right now)")
+
+    if lb is None or lb.empty or lb.dropna(subset=["Value %"]).empty:
+        st.info("No market data available yet.")
+        return
+
+    top = lb.dropna(subset=["Value %"]).iloc[0]
+    city = str(top["City"])
+    contract = str(top.get("Best contract", ""))
+    val = top.get("Value %")
+    yes_ask = top.get("YES ask %")
+    model = top.get("Model %")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("City", city)
+    c2.metric("Contract", contract)
+    c3.metric("Edge (Value %)", ("{:+.1f}%".format(val) if pd.notna(val) else ""))
+    c4.metric("Price (YES ask)", ("{:.1f}%".format(yes_ask) if pd.notna(yes_ask) else ""))
+
+    # Secondary line: model vs market
+    if pd.notna(model) and pd.notna(yes_ask):
+        st.caption(f"Model {model:.1f}% vs Market {yes_ask:.1f}%")
+
+    if pd.isna(val):
+        st.info("No value signal right now.")
+    elif float(val) > 0:
+        st.success(f"Top pick: **{city} — {contract}** (edge **+{float(val):.1f}%**) ")
+    else:
+        st.warning(f"No positive edge right now. Best available is **{city} — {contract}** ({float(val):+.1f}%).")
+
 # -----------------------
 # Manual refresh
 # -----------------------
@@ -154,6 +186,8 @@ for city_name in CITIES.keys():
 lb = pd.DataFrame(leader_rows)
 lb["_sort"] = lb["Value %"].fillna(-1e18)
 lb = lb.sort_values("_sort", ascending=False).drop(columns=["_sort"])
+
+render_overall_best_bet(lb)
 
 styled_lb = (
     lb.style
