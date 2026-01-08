@@ -19,7 +19,7 @@ CITIES = {
     "Los Angeles":  {"series": "KXHIGHLAX",  "station_obs": "KLAX", "station_label": "Los Angeles Intl (KLAX)", "lat": 33.9425, "lon": -118.4081},
     "Denver":       {"series": "KXHIGHDEN",  "station_obs": "KDEN", "station_label": "Denver Intl (KDEN)", "lat": 39.8561, "lon": -104.6737},
     "Miami":        {"series": "KXHIGHMIA",  "station_obs": "KMIA", "station_label": "Miami Intl (KMIA)", "lat": 25.7959, "lon": -80.2870},
-    "NYC":          {"series": "KXHIGHNY",   "station_obs": "NYC",  "station_label": "Central Park (KNYC / NYC)", "lat": 40.7790, "lon": -73.96925},
+    "NYC":          {"series": "KXHIGHNY",   "station_obs": "KNYC", "station_label": "Central Park (KNYC)", "lat": 40.7790, "lon": -73.96925},
     "Chicago":      {"series": "KXHIGHCHI",  "station_obs": "KMDW", "station_label": "Chicago Midway (KMDW)", "lat": 41.7868, "lon": -87.7522},
     "Austin":       {"series": "KXHIGHAUS",  "station_obs": "KAUS", "station_label": "Austin–Bergstrom (KAUS)", "lat": 30.1945, "lon": -97.6699},
 }
@@ -47,37 +47,58 @@ def value_color(v):
         return ""
     return "color: #22c55e;" if v > 0 else "color: #ef4444;"
 
-def render_overall_best_bet(lb: pd.DataFrame):
-    """Render a single global best-bet banner based on the current leaderboard."""
+def render_overall_best_bet(snapshot_tables: dict):
+    """Render a single global best-bet banner scanning ALL buckets across ALL cities."""
     st.subheader("Overall best bet (right now)")
 
-    if lb is None or lb.empty or lb.dropna(subset=["Value %"]).empty:
+    best = None
+
+    for city, df in snapshot_tables.items():
+        if df is None or getattr(df, "empty", True):
+            continue
+        if "Value %" not in df.columns:
+            continue
+
+        cand = df.dropna(subset=["Value %"]).copy()
+        if cand.empty:
+            continue
+
+        # Pick best bucket within this city
+        top_city = cand.sort_values("Value %", ascending=False).iloc[0]
+        val = float(top_city["Value %"])
+
+        if (best is None) or (val > best["value"]):
+            best = {
+                "city": city,
+                "contract": str(top_city.get("Contract", "")),
+                "value": val,
+                "yes_ask": top_city.get("YES ask %"),
+                "model": top_city.get("Model %"),
+            }
+
+    if best is None:
         st.info("No market data available yet.")
         return
 
-    top = lb.dropna(subset=["Value %"]).iloc[0]
-    city = str(top["City"])
-    contract = str(top.get("Best contract", ""))
-    val = top.get("Value %")
-    yes_ask = top.get("YES ask %")
-    model = top.get("Model %")
+    city = best["city"]
+    contract = best["contract"]
+    val = best["value"]
+    yes_ask = best.get("yes_ask")
+    model = best.get("model")
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("City", city)
     c2.metric("Contract", contract)
-    c3.metric("Edge (Value %)", ("{:+.1f}%".format(val) if pd.notna(val) else ""))
+    c3.metric("Edge (Value %)", f"{val:+.1f}%")
     c4.metric("Price (YES ask)", ("{:.1f}%".format(yes_ask) if pd.notna(yes_ask) else ""))
 
-    # Secondary line: model vs market
     if pd.notna(model) and pd.notna(yes_ask):
-        st.caption(f"Model {model:.1f}% vs Market {yes_ask:.1f}%")
+        st.caption(f"Model {float(model):.1f}% vs Market {float(yes_ask):.1f}%")
 
-    if pd.isna(val):
-        st.info("No value signal right now.")
-    elif float(val) > 0:
-        st.success(f"Top pick: **{city} — {contract}** (edge **+{float(val):.1f}%**) ")
+    if val > 0:
+        st.success(f"Top pick: **{city} — {contract}** (edge **+{val:.1f}%**)")
     else:
-        st.warning(f"No positive edge right now. Best available is **{city} — {contract}** ({float(val):+.1f}%).")
+        st.warning(f"No positive edge right now. Best available is **{city} — {contract}** ({val:+.1f}%).")
 
 # -----------------------
 # Manual refresh
@@ -187,7 +208,8 @@ lb = pd.DataFrame(leader_rows)
 lb["_sort"] = lb["Value %"].fillna(-1e18)
 lb = lb.sort_values("_sort", ascending=False).drop(columns=["_sort"])
 
-render_overall_best_bet(lb)
+snapshot_tables = {city: snapshots[city][0] for city in snapshots}
+render_overall_best_bet(snapshot_tables)
 
 styled_lb = (
     lb.style
@@ -240,25 +262,30 @@ else:
     except Exception:
         pass
 
-    # Two charts: past 24h observed + next 24h forecast
+    # Two charts: past 12h observed + next 12h forecast
 try:
     apply_city(cfg)
 
-    # ---- Past 24h observed (NWS station) ----
-    past = pe.nws_obs_past_hours_station(24)
+    # ---- Past 12h observed (NWS station) ----
+    past = pe.nws_obs_past_hours_station(12)
     df_p = pd.DataFrame(past)
     if not df_p.empty:
         df_p = df_p.sort_values("time_local").rename(columns={"time_local":"time"})
 
+        # Downsample: keep only points when the observed temp changes (full-degree), plus the first point
+        df_p["deg"] = df_p["temp_f"].round(0).astype(int)
+        df_p["deg_prev"] = df_p["deg"].shift(1)
+        df_p = df_p[df_p["deg_prev"].isna() | (df_p["deg"] != df_p["deg_prev"])].copy()
+
         ymin = float(df_p["temp_f"].min()) - 2.0
         ymax = float(df_p["temp_f"].max()) + 2.0
 
-        st.subheader("Observed — past 24 hours (NWS station)")
+        st.subheader("Observed — past 12 hours (NWS station)")
         chart_p = (
             alt.Chart(df_p)
             .mark_line(point=True)
             .encode(
-                x=alt.X("time:T", axis=alt.Axis(format="%b %-d %-I %p", tickCount=10, title=None)),
+                x=alt.X("time:T", axis=alt.Axis(format="%b %-d %-I %p", tickCount=6, title=None)),
                 y=alt.Y("temp_f:Q", scale=alt.Scale(domain=[ymin, ymax]), axis=alt.Axis(title="°F")),
                 tooltip=[
                     alt.Tooltip("time:T", title="Time", format="%b %-d %-I:%M %p"),
@@ -269,10 +296,10 @@ try:
         )
         st.altair_chart(chart_p, use_container_width=True)
     else:
-        st.caption("Observed chart: no station observations returned for the past 24 hours.")
+        st.caption("Observed chart: no station observations returned for the past 12 hours.")
 
-    # ---- Next 24h forecast (NWS hourly) ----
-    fut = pe.nws_hourly_forecast_next_hours(24)
+    # ---- Next 12h forecast (NWS hourly) ----
+    fut = pe.nws_hourly_forecast_next_hours(12)
     df_f = pd.DataFrame(fut)
     if not df_f.empty:
         df_f = df_f.sort_values("time_local").rename(columns={"time_local":"time"})
@@ -285,9 +312,9 @@ try:
         ymin2 = float(df_f["temp_f"].min()) - 2.0
         ymax2 = float(df_f["temp_f"].max()) + 2.0
 
-        st.subheader("Forecast — next 24 hours (NWS hourly)")
+        st.subheader("Forecast — next 12 hours (NWS hourly)")
         base = alt.Chart(df_f).encode(
-            x=alt.X("time:T", axis=alt.Axis(format="%b %-d %-I %p", tickCount=10, title=None)),
+            x=alt.X("time:T", axis=alt.Axis(format="%b %-d %-I %p", tickCount=6, title=None)),
             y=alt.Y("temp_f:Q", scale=alt.Scale(domain=[ymin2, ymax2]), axis=alt.Axis(title="°F")),
             tooltip=[
                 alt.Tooltip("time:T", title="Time", format="%b %-d %-I:%M %p"),
@@ -298,7 +325,7 @@ try:
         line = base.mark_line(point=True)
 
         pts = alt.Chart(df_marks).mark_point(filled=True, size=70).encode(
-            x="time:T", y="temp_f:Q",
+            x=alt.X("time:T", axis=alt.Axis(format="%b %-d %-I %p", tickCount=6, title=None)), y="temp_f:Q",
             tooltip=[
                 alt.Tooltip("time:T", title="Time", format="%b %-d %-I:%M %p"),
                 alt.Tooltip("temp_f:Q", title="Temp (°F)", format=".1f"),
@@ -307,14 +334,14 @@ try:
         )
 
         lbl = alt.Chart(df_marks).mark_text(dy=-10).encode(
-            x="time:T", y="temp_f:Q",
+            x=alt.X("time:T", axis=alt.Axis(format="%b %-d %-I %p", tickCount=6, title=None)), y="temp_f:Q",
             text=alt.Text("deg:Q", format="d"),
         )
 
         chart_f = alt.layer(line, pts, lbl).properties(height=260)
         st.altair_chart(chart_f, use_container_width=True)
     else:
-        st.caption("Forecast chart: no hourly forecast returned for the next 24 hours.")
+        st.caption("Forecast chart: no hourly forecast returned for the next 12 hours.")
 
 except Exception as e:
     st.warning(f"Charts unavailable: {e}")
