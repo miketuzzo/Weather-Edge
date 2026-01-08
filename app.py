@@ -292,7 +292,7 @@ def get_city_sigma(city_name: str) -> float:
 # -----------------------
 st.markdown("## Weather Edge — Multi-City (Daily High)")
 st.caption("Leaderboard ranks cities by their best Value% (highest → lowest). Settlement station shown in City view.")
-st.caption(f"Deploy check — commit `{DEPLOY_SHA}` · loaded {APP_LOADED_ET.strftime('%Y-%m-%d %I:%M %p ET')}")
+st.caption(f"Deploy check — commit `{DEPLOY_SHA}` · loaded {APP_LOADED_ET.strftime('%Y-%m-%d %I:%M %p %Z')}")
 best_bet_slot = st.container()
 
 load_status = st.empty()
