@@ -5,13 +5,13 @@ from streamlit_autorefresh import st_autorefresh
 import altair as alt
 import philly_edge as pe
 from datetime import datetime, timezone
+import time
 from zoneinfo import ZoneInfo
 import os
 from typing import Optional
 
 # --- Deploy check (confirms Streamlit redeployed your latest push) ---
 ET_TZ = ZoneInfo("America/New_York")
-APP_LOADED_ET = datetime.now(tz=ET_TZ)
 
 def _read_text(path: str) -> str:
     try:
@@ -39,7 +39,53 @@ def get_git_sha_short() -> str:
 
     return ""
 
+def _parse_git_log_epoch(line: str) -> Optional[int]:
+    """Parse an epoch seconds timestamp from a git log line.
+    Typical format ends with: '<epoch> <tz>\t<message>'
+    We parse from the right to avoid issues with committer names containing spaces.
+    """
+    try:
+        if not line:
+            return None
+        left = line.split("\t", 1)[0].strip()
+        parts = left.split()
+        # last two tokens are <epoch> <tz>
+        if len(parts) < 2:
+            return None
+        epoch_s = int(parts[-2])
+        return epoch_s
+    except Exception:
+        return None
+
+def get_deploy_time_et() -> Optional[datetime]:
+    """Best-effort 'last deployed' timestamp.
+    On Streamlit Cloud, .git logs often exist and give the commit time.
+    Fallback to app.py mtime if needed.
+    """
+    # 1) Try git logs (preferred)
+    for log_path in (
+        ".git/logs/HEAD",
+        ".git/logs/refs/heads/main",
+        ".git/logs/refs/remotes/origin/main",
+    ):
+        log_txt = _read_text(log_path)
+        if not log_txt:
+            continue
+        last = log_txt.splitlines()[-1].strip()
+        epoch = _parse_git_log_epoch(last)
+        if epoch:
+            return datetime.fromtimestamp(epoch, tz=timezone.utc).astimezone(ET_TZ)
+
+    # 2) Fallback: file modified time (not perfect, but stable)
+    try:
+        mtime = os.path.getmtime(__file__)
+        return datetime.fromtimestamp(mtime, tz=timezone.utc).astimezone(ET_TZ)
+    except Exception:
+        return None
+
 DEPLOY_SHA = get_git_sha_short() or "unknown"
+DEPLOYED_AT_ET = get_deploy_time_et()
+APP_LOADED_ET = datetime.now(tz=ET_TZ)
 
 # Make charts crisp on Safari/mobile (avoid blurry canvas scaling)
 try:
@@ -292,7 +338,14 @@ def get_city_sigma(city_name: str) -> float:
 # -----------------------
 st.markdown("## Weather Edge — Multi-City (Daily High)")
 st.caption("Leaderboard ranks cities by their best Value% (highest → lowest). Settlement station shown in City view.")
-st.caption(f"Deploy check — commit `{DEPLOY_SHA}` · loaded {APP_LOADED_ET.strftime('%Y-%m-%d %I:%M %p %Z')}")
+deployed_txt = (
+    DEPLOYED_AT_ET.strftime('%Y-%m-%d %I:%M %p %Z')
+    if DEPLOYED_AT_ET is not None
+    else "unknown"
+)
+st.caption(
+    f"Deploy check — commit `{DEPLOY_SHA}` · deployed {deployed_txt} · page loaded {APP_LOADED_ET.strftime('%Y-%m-%d %I:%M %p %Z')}"
+)
 best_bet_slot = st.container()
 
 load_status = st.empty()
