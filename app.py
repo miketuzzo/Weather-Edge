@@ -7,6 +7,7 @@ import philly_edge as pe
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 import os
+from typing import Optional
 
 # --- Deploy check (confirms Streamlit redeployed your latest push) ---
 APP_LOADED_UTC = datetime.now(timezone.utc)
@@ -117,15 +118,12 @@ def market_lock_info(df: pd.DataFrame, best_contract=None):
 
     return (status, top_contract, top_val, is_locked, is_not_viable)
 
-
 def value_color(v):
     if v is None or (isinstance(v, float) and pd.isna(v)):
         return ""
     return "color: #22c55e;" if v > 0 else "color: #ef4444;"
-
 # -----------------------
 # Lock times (global): 9:30 CST and 12:00 CST
-# -----------------------
 # -----------------------
 LOCK_TZ = ZoneInfo("America/Chicago")
 LOCK_HOUR = 9
@@ -173,11 +171,6 @@ def render_overall_best_bet(snapshot_tables: dict):
         if ("Model %" not in df.columns) or ("YES ask %" not in df.columns):
             continue
 
-        # If the market is effectively locked, only the dominant contract is "viable"
-        status_lock, dom_contract, dom_yes, is_locked, _ = market_lock_info(df, best_contract=None)
-        if is_locked and dom_contract:
-            df = df[df["Contract"] == dom_contract].copy()
-
         cand = df.dropna(subset=["Model %", "YES ask %"]).copy()
         if cand.empty:
             continue
@@ -188,6 +181,13 @@ def render_overall_best_bet(snapshot_tables: dict):
         cand = cand.dropna(subset=["_model_p", "_mkt_p"]).copy()
         if cand.empty:
             continue
+
+        # If market is locked, only the dominant contract is viable.
+        _st, _dom, _dom_yes, _locked, _not_viable = market_lock_info(df, best_contract=None)
+        if _locked and _dom is not None:
+            cand = cand[cand["Contract"].astype(str) == str(_dom)].copy()
+            if cand.empty:
+                continue
 
         # accuracy-first score (market-blended)
         cand["_acc_score"] = (W_MODEL * cand["_model_p"]) + (W_MKT * cand["_mkt_p"])
@@ -274,7 +274,7 @@ def render_overall_best_bet(snapshot_tables: dict):
 
     st.markdown("</div>", unsafe_allow_html=True)
 
-@st.cache_data(show_spinner=False, ttl=12*60*60)
+@st.cache_data(show_spinner=False, ttl=24*60*60)
 def get_city_sigma(city_name: str) -> float:
     """Calibrate sigma infrequently so the app doesn't hang on first load."""
     cfg = CITIES[city_name]
@@ -297,39 +297,34 @@ best_bet_slot = st.container()
 load_status = st.empty()
 load_status.info("Loading live markets… (first load can take ~10–20s)")
 
+# Update outcomes for past days (historical tracking) — cache so it doesn't run every rerun
+@st.cache_data(show_spinner=False, ttl=60*60)
+def _update_outcomes_cached():
+    if hasattr(pe, "perf_update_outcomes"):
+        try:
+            pe.perf_update_outcomes()
+        except Exception:
+            pass
+
+_update_outcomes_cached()
+
 if st.button("🔄 Refresh"):
     st.cache_data.clear()
     st.rerun()
 
-
-# -----------------------
-# Performance outcome updater (cached)
-# Runs at most once per hour so the app stays fast.
-# -----------------------
-@st.cache_data(show_spinner=False, ttl=60*60)
-def _update_outcomes_hourly() -> bool:
-    if hasattr(pe, "perf_update_outcomes"):
-        try:
-            pe.perf_update_outcomes()
-            return True
-        except Exception:
-            return False
-    return False
-
-
-@st.cache_data(show_spinner=False)
-def compute_city_snapshot(city_name: str):
+@st.cache_data(show_spinner=False, ttl=120)
+def compute_city_snapshot(city_name: str, fast: bool = False):
     """
     Returns:
       df (DataFrame): per-bucket table (may be empty)
-      best (dict|None): best row by Value% (may be None)
+      best (dict|None): best row by accuracy-first score (may be None)
       sigma (float): calibrated sigma (best-effort)
       labels (list): bucket labels (may be empty)
       err (str): non-fatal error message for UI ("" if OK)
     """
     cfg = CITIES[city_name]
     apply_city(cfg)
-    sigma = get_city_sigma(city_name)
+    sigma = 2.0 if fast else get_city_sigma(city_name)
 
     # Fetch markets (can fail if env vars missing / API issues)
     try:
@@ -379,10 +374,42 @@ def compute_city_snapshot(city_name: str):
 
     df = pd.DataFrame(rows)
 
+    # If the market is effectively locked (one contract ~certain), don't call a different contract the "best bet".
+    status_str, dom_contract, dom_yes, is_locked, is_not_viable = market_lock_info(df, best_contract=None)
+
+    # Pick logic
+    # 1) If market is locked, the only viable contract is the dominant one.
     best = None
-    cand = df.dropna(subset=["Value %"]).copy()
-    if len(cand):
-        best = cand.sort_values("Value %", ascending=False).iloc[0].to_dict()
+    if is_locked and dom_contract is not None:
+        dom_rows = df[df["Contract"].astype(str) == str(dom_contract)]
+        if len(dom_rows):
+            best = dom_rows.iloc[0].to_dict()
+            best["Acc score %"] = None
+
+    # 2) Otherwise: accuracy-first, lightly market-blended.
+    #    Score = 0.90*Model + 0.10*Market(YES ask). Value% only breaks ties.
+    if best is None:
+        cand = df.dropna(subset=["Model %", "YES ask %"]).copy()
+        if len(cand):
+            cand["_model_p"] = pd.to_numeric(cand["Model %"], errors="coerce") / 100.0
+            cand["_mkt_p"] = pd.to_numeric(cand["YES ask %"], errors="coerce") / 100.0
+            cand["_value_p"] = pd.to_numeric(cand.get("Value %", 0.0), errors="coerce").fillna(0.0) / 100.0
+            cand = cand.dropna(subset=["_model_p", "_mkt_p"]).copy()
+            if len(cand):
+                cand["_acc"] = 0.90 * cand["_model_p"] + 0.10 * cand["_mkt_p"]
+                top = cand.sort_values(["_acc", "_model_p", "_value_p"], ascending=[False, False, False]).iloc[0]
+                best = top.to_dict()
+                try:
+                    best["Acc score %"] = float(top["_acc"]) * 100.0
+                except Exception:
+                    best["Acc score %"] = None
+
+    # 3) Final fallback (should be rare): use Value%.
+    if best is None:
+        cand = df.dropna(subset=["Value %"]).copy()
+        if len(cand):
+            best = cand.sort_values("Value %", ascending=False).iloc[0].to_dict()
+            best["Acc score %"] = None
 
     return df, best, sigma, labels, ""
 
@@ -425,13 +452,8 @@ if after_1200 and not locked_1200:
         DO_LOCK_1200 = False
 
 for city_name in CITIES.keys():
-    df, best, sigma, labels, err = compute_city_snapshot(city_name)
+    df, best, sigma, labels, err = compute_city_snapshot(city_name, fast=True)
     snapshots[city_name] = (df, sigma, labels, err)
-
-    # Market lock / viability indicator (based on Kalshi YES ask distribution)
-    status, dom_contract, dom_yes, is_locked, is_not_viable = market_lock_info(
-        df, best_contract=(best.get("Contract") if isinstance(best, dict) else None)
-    )
 
     # Append snapshot row for each city if possible
     if hasattr(pe, "snap_append_row") and df is not None and not df.empty:
@@ -504,30 +526,70 @@ for city_name in CITIES.keys():
         leader_rows.append({
             "City": city_name,
             "Best contract": "(no market data)",
+            "Acc score %": None,
             "Value %": None,
             "YES ask %": None,
             "Model %": None,
             "Odds": "",
             "σ": sigma,
-            "Status": status,
         })
     else:
         leader_rows.append({
             "City": city_name,
             "Best contract": best.get("Contract"),
+            "Acc score %": best.get("Acc score %"),
             "Value %": best.get("Value %"),
             "YES ask %": best.get("YES ask %"),
             "Model %": best.get("Model %"),
             "Odds": best.get("Odds", ""),
             "σ": sigma,
-            "Status": status,
         })
 
 load_status.empty()
 
 lb = pd.DataFrame(leader_rows)
-lb["_sort"] = lb["Value %"].fillna(-1e18)
+
+# Ensure numeric columns are real numbers (None -> NaN) so Styler formatters
+# don't crash with "unsupported format string passed to NoneType".
+for _col in ["Acc score %", "Value %", "YES ask %", "Model %", "σ"]:
+    if _col in lb.columns:
+        lb[_col] = pd.to_numeric(lb[_col], errors="coerce")
+
+# Rank cities by accuracy-first score (fallback to Value% if missing)
+if "Acc score %" in lb.columns:
+    lb["_sort"] = lb["Acc score %"].fillna(-1e18)
+else:
+    lb["_sort"] = lb["Value %"].fillna(-1e18)
 lb = lb.sort_values("_sort", ascending=False).drop(columns=["_sort"])
+
+# Live market status column (locked / not viable)
+def _status_for_city(city: str, best_contract: Optional[str]) -> str:
+    df0 = snapshots.get(city, (None, None, None, ""))[0]
+    status_str, dom_contract, dom_yes, is_locked, is_not_viable = market_lock_info(df0, best_contract=best_contract)
+    if is_not_viable and dom_contract is not None and dom_yes is not None:
+        return f"⛔ Locked to {dom_contract} ({float(dom_yes):.1f}%)"
+    if is_locked and dom_contract is not None and dom_yes is not None:
+        return f"🔒 Locked to {dom_contract} ({float(dom_yes):.1f}%)"
+    return status_str or "Live"
+
+lb["Status"] = [
+    _status_for_city(row["City"], row.get("Best contract"))
+    for _, row in lb.iterrows()
+]
+
+# Nice column order for the leaderboard
+_cols = [
+    "City",
+    "Status",
+    "Best contract",
+    "Acc score %",
+    "Model %",
+    "YES ask %",
+    "Value %",
+    "Odds",
+    "σ",
+]
+lb = lb[[c for c in _cols if c in lb.columns]]
 
 snapshot_tables = {city: snapshots[city][0] for city in snapshots}
 with best_bet_slot:
@@ -543,7 +605,10 @@ if errs:
 
 styled_lb = (
     lb.style
-      .format({"Value %": "{:+.1f}%", "YES ask %": "{:.1f}%", "Model %": "{:.1f}%", "σ": "{:.2f}"})
+      .format(
+          {"Acc score %": "{:.1f}%", "Value %": "{:+.1f}%", "YES ask %": "{:.1f}%", "Model %": "{:.1f}%", "σ": "{:.2f}"},
+          na_rep="—",
+      )
       .map(value_color, subset=["Value %"])
 )
 
@@ -561,24 +626,9 @@ default_city = (
 )
 city_pick = st.selectbox("Select a city", lb["City"].tolist(), index=list(lb["City"]).index(default_city))
 
-df_city, sigma_city, _labels_city, err_city = snapshots[city_pick]
+df_city, best_city, sigma_city, _labels_city, err_city = compute_city_snapshot(city_pick, fast=False)
 cfg = CITIES[city_pick]
 st.caption(f"Settlement station: {cfg['station_label']}")
-
-# Market lock status for this city's current "best bet"
-try:
-    best_contract_city = None
-    if "Best contract" in lb.columns:
-        row_pick = lb[lb["City"] == city_pick]
-        if len(row_pick):
-            best_contract_city = row_pick.iloc[0].get("Best contract")
-    status2, dom_c, dom_yes, is_locked2, is_not_viable2 = market_lock_info(df_city, best_contract=best_contract_city)
-    if status2:
-        extra = f" · Dominant: {dom_c} ({dom_yes:.1f}% YES ask)" if dom_c and dom_yes is not None else ""
-        st.caption(f"Market status: {status2}{extra}")
-except Exception:
-    pass
-
 
 if err_city:
     st.warning(f"{city_pick} live data error: {err_city}")
@@ -699,10 +749,6 @@ except Exception as e:
 # -----------------------
 if hasattr(pe, "perf_load_df"):
     st.subheader("Historical performance")
-
-    # Update outcomes (hourly cached) so win/loss stats populate without slowing every page load
-    _update_outcomes_hourly()
-
     perf = pe.perf_load_df()
     done = perf.dropna(subset=["observed_high_f", "winning_contract", "profit"]).copy()
 
