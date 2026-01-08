@@ -162,8 +162,11 @@ def sign_request(private_key, timestamp_ms: str, method: str, path: str) -> str:
     return base64.b64encode(sig).decode("utf-8")
 
 def kalshi_get(path: str, params=None) -> dict:
-    key_id = os.getenv("KALSHI_KEY_ID")
-    key_path = os.getenv("KALSHI_PRIVATE_KEY_PATH", "").strip()
+    # Accept both local-dev env names and Streamlit Cloud env names
+    key_id = (os.getenv("KALSHI_KEY_ID") or os.getenv("KALSHI_API_KEY_ID") or "").strip()
+    key_path = (os.getenv("KALSHI_PRIVATE_KEY_PATH") or os.getenv("KALSHI_API_PRIVATE_KEY_PATH") or "").strip()
+    if not key_id:
+        raise RuntimeError("Missing Kalshi key id. Set KALSHI_KEY_ID (recommended) or KALSHI_API_KEY_ID.")
     private_key = load_private_key(key_path)
 
     ts = str(int(time.time() * 1000))
@@ -244,6 +247,98 @@ def best_yes_mid(mkt: dict) -> float:
     if yb is None or ya is None:
         return None
     return (yb + ya) / 2.0 / 100.0  # cents -> dollars prob
+
+# --- Market probability helpers (for blending / accuracy-first picks) ---
+
+def market_mid_prob(mkt: dict):
+    """Return market-implied probability using YES mid when available; else YES ask; else None."""
+    mid = best_yes_mid(mkt)
+    if mid is not None:
+        return mid
+    return yes_ask_prob(mkt)
+
+
+def blended_prob(p_model: float, p_market: float, alpha: float = 0.85) -> float:
+    """Blend model probability with market probability.
+
+    alpha=1.0 -> pure model
+    alpha=0.0 -> pure market
+    """
+    a = float(alpha)
+    if a < 0.0:
+        a = 0.0
+    if a > 1.0:
+        a = 1.0
+    return (a * float(p_model)) + ((1.0 - a) * float(p_market))
+
+
+def pick_best_bucket(
+    bucket_markets: list,
+    probs: dict,
+    pick_mode: str = "accuracy",
+    alpha: float = 0.85,
+):
+    """Accuracy-first picker.
+
+    pick_mode:
+      - "accuracy": maximize blended(model_prob, market_prob)
+      - "value": maximize (model_prob - yes_ask_prob)
+    """
+    mode = (pick_mode or "accuracy").strip().lower()
+
+    best = None
+    best_score = None
+
+    for bm in bucket_markets:
+        label = bm.get("label")
+        m = bm.get("market") or {}
+        if not label:
+            continue
+
+        p_model = float(probs.get(label, 0.0))
+        yes_ask = yes_ask_prob(m)
+        mid = best_yes_mid(m)
+        p_mkt = market_mid_prob(m)
+
+        # Need a market probability to blend, and need a YES ask to compute value
+        if mode == "accuracy":
+            if p_mkt is None:
+                continue
+            score = blended_prob(p_model, p_mkt, alpha=alpha)
+        else:
+            if yes_ask is None:
+                continue
+            score = p_model - yes_ask
+
+        # Tiebreakers: higher model prob, then higher value
+        value_p = None
+        if yes_ask is not None:
+            value_p = p_model - yes_ask
+
+        cand = {
+            "label": label,
+            "yes_ask": yes_ask,
+            "market_mid": mid,
+            "market_p": p_mkt,
+            "model_p": p_model,
+            "value_p": value_p,
+            "blend_p": (None if p_mkt is None else blended_prob(p_model, p_mkt, alpha=alpha)),
+        }
+
+        if (best_score is None) or (score > best_score):
+            best = cand
+            best_score = score
+        elif score == best_score and best is not None:
+            # tie: prefer higher model prob, then higher value prob
+            if cand["model_p"] > best.get("model_p", -1):
+                best = cand
+            else:
+                cv = cand.get("value_p")
+                bv = best.get("value_p")
+                if (cv is not None) and (bv is not None) and (cv > bv):
+                    best = cand
+
+    return best
 
 def label_for_market(mkt: dict) -> str:
     return (mkt.get("yes_sub_title") or mkt.get("title") or mkt.get("ticker") or "").strip()
@@ -625,7 +720,7 @@ def _fetch_observed_daily_high(date_s: str) -> Optional[float]:
         return None
     return float(max(temps))
 
-def _robust_std(vals: list[float]) -> Optional[float]:
+def _robust_std(vals) -> Optional[float]:
     """Robust sigma estimate using MAD -> std (scaled)."""
     vals = [v for v in vals if v == v]  # remove NaN
     if len(vals) < 5:
@@ -709,8 +804,8 @@ def calibrate_sigma(days_back: int = 14, default: float = 2.0, min_sigma: float 
 # -----------------------
 from typing import Optional
 import json
+import csv
 from pathlib import Path
-import pandas as pd
 
 PROJECT_DATA_DIR = Path(__file__).resolve().parent / "data"
 PROJECT_DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -769,88 +864,329 @@ def _ensure_perf_header():
         return
     PERF_CSV.write_text(
         "date,city,station,sigma_f,labels_json,best_contract,yes_ask_prob,model_prob,value_prob,"
-        "observed_high_f,winning_contract,won,profit\n",
+        "observed_high_f,winning_contract,won,profit,strategy\n",
         encoding="utf-8"
     )
 
-def perf_log_snapshot(date_s: str, city: str, station: str, sigma_f: float,
-                      labels: list, best_contract: str,
-                      yes_ask_prob: Optional[float], model_prob: Optional[float], value_prob: Optional[float]):
-    """
-    Writes ONE row per city per day (deduped by date+city).
-    yes_ask_prob/model_prob/value_prob are in 0..1 (not percent).
+def perf_log_snapshot(
+    date_s: str,
+    city: str,
+    station: str,
+    sigma_f: float,
+    labels: list,
+    best_contract: str,
+    yes_ask_prob: Optional[float],
+    model_prob: Optional[float],
+    value_prob: Optional[float],
+    strategy: str = "lock_0930",
+):
+    """Append ONE row per city per day per strategy (deduped by date+city+strategy).
+
+    Stores labels_json as a JSON array string. Uses csv module to avoid quoting bugs.
+    yes_ask_prob/model_prob/value_prob are 0..1.
     """
     _ensure_perf_header()
 
-    # Deduplicate
+    # Deduplicate by (date, city, strategy)
     if PERF_CSV.exists():
-        existing = PERF_CSV.read_text(encoding="utf-8").splitlines()
-        for line in existing[1:]:
-            if not line.strip():
-                continue
-            parts = line.split(",")
-            if len(parts) >= 2 and parts[0] == date_s and parts[1] == city:
-                return
+        try:
+            with PERF_CSV.open("r", newline="", encoding="utf-8") as f:
+                r = csv.DictReader(f)
+                for row in r:
+                    if (row.get("date") == date_s) and (row.get("city") == city) and (row.get("strategy", "") == strategy):
+                        return
+        except Exception:
+            # If file is malformed, we still try to append; updater can clean later.
+            pass
 
-    labels_json = json.dumps(labels, separators=(",", ":"))
+    columns = [
+        "date","city","station","sigma_f","labels_json","best_contract",
+        "yes_ask_prob","model_prob","value_prob",
+        "observed_high_f","winning_contract","won","profit","strategy",
+    ]
 
-    def fnum(x):
-        return "" if x is None else f"{float(x):.6f}"
+    labels_json = json.dumps(labels, ensure_ascii=False)
 
-    row = (
-        f"{date_s},{city},{station},{float(sigma_f):.6f},{json.dumps(labels_json)},"
-        f"{best_contract},{fnum(yes_ask_prob)},{fnum(model_prob)},{fnum(value_prob)},"
-        f",,,,\n"
-    )
-    with PERF_CSV.open("a", encoding="utf-8") as f:
-        f.write(row)
+    out_row = {
+        "date": date_s,
+        "city": city,
+        "station": station,
+        "sigma_f": f"{float(sigma_f):.6f}",
+        "labels_json": labels_json,
+        "best_contract": best_contract,
+        "yes_ask_prob": "" if yes_ask_prob is None else f"{float(yes_ask_prob):.6f}",
+        "model_prob": "" if model_prob is None else f"{float(model_prob):.6f}",
+        "value_prob": "" if value_prob is None else f"{float(value_prob):.6f}",
+        "observed_high_f": "",
+        "winning_contract": "",
+        "won": "",
+        "profit": "",
+        "strategy": strategy,
+    }
+
+    with PERF_CSV.open("a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=columns)
+        # If file existed but was empty, ensure header
+        if PERF_CSV.stat().st_size == 0:
+            w.writeheader()
+        w.writerow(out_row)
+
+
+
+# CSV repair helpers
+import re
+
+
+def _normalize_labels_json(raw: str) -> Optional[str]:
+    """Normalize `labels_json` to a clean JSON array string.
+
+    Target stored format:
+      ["52° or below", "53° to 54°", ...]
+
+    Notes:
+    - Older rows may contain backslash-escaped quotes (\") and/or literal unicode escapes (\\u00b0).
+    - We canonicalize by parsing to a Python list, cleaning each label, and json-dumping with ensure_ascii=False.
+    """
+    if raw is None:
+        return None
+
+    s = str(raw).strip()
+    if not s:
+        return None
+
+    def _clean_label(v: str) -> str:
+        vv = str(v).strip().replace("º", "°")
+
+        # If labels were stored with extra surrounding quotes, strip them repeatedly.
+        for _ in range(4):
+            if vv.startswith('"') and vv.endswith('"') and len(vv) >= 2:
+                vv = vv[1:-1].strip()
+
+        # Undo common legacy artifacts
+        vv = vv.replace('\\"', '"')
+
+        # Convert literal unicode escape sequences to actual symbols (most commonly degree sign)
+        vv = vv.replace('\\u00b0', '°')
+        vv = vv.replace('\\U00B0', '°')
+
+        # Rare: stray trailing backslash
+        if vv.endswith('\\'):
+            vv = vv[:-1]
+
+        return vv
+
+    def _to_list(obj) -> Optional[list]:
+        if isinstance(obj, list):
+            return obj
+        if isinstance(obj, str):
+            try:
+                obj2 = json.loads(obj)
+                if isinstance(obj2, list):
+                    return obj2
+            except Exception:
+                return None
+        return None
+
+    # 1) Try direct JSON parse
+    try:
+        obj = json.loads(s)
+        lst = _to_list(obj)
+        if lst is not None:
+            cleaned = [_clean_label(x) for x in lst]
+            return json.dumps(cleaned, ensure_ascii=False)
+    except Exception:
+        pass
+
+    # 2) Try a light de-escape pass (legacy backslash-escaped quotes)
+    try:
+        s2 = s.replace('\\"', '"')
+        obj = json.loads(s2)
+        lst = _to_list(obj)
+        if lst is not None:
+            cleaned = [_clean_label(x) for x in lst]
+            return json.dumps(cleaned, ensure_ascii=False)
+    except Exception:
+        pass
+
+    return None
+
+
+def _row_has_surplus_columns(row: dict) -> bool:
+    # csv.DictReader stores surplus columns under key None
+    return isinstance(row, dict) and (None in row and row.get(None))
+
+
+def perf_repair_csv_in_place() -> int:
+    """Repair/normalize data/performance.csv in place.
+
+    What it fixes:
+    - `labels_json` stored in legacy escaped-quotes form (breaks json.loads)
+    - missing `value_prob` (recomputed as model_prob - yes_ask_prob when possible)
+    - missing `strategy` column
+    - rows with surplus columns (key None) are salvaged best-effort
+
+    IMPORTANT: If the file is already clean, this returns 0 and makes NO CHANGES.
+    """
+    if not PERF_CSV.exists():
+        return 0
+
+    # Desired schema (stable)
+    fieldnames = [
+        "date","city","station","sigma_f","labels_json","best_contract",
+        "yes_ask_prob","model_prob","value_prob",
+        "observed_high_f","winning_contract","won","profit","strategy",
+    ]
+
+    with PERF_CSV.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+
+    # If file is empty/missing header, ensure header and exit
+    if not rows and (not PERF_CSV.read_text(encoding="utf-8", errors="ignore").strip()):
+        with PERF_CSV.open("w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            w.writeheader()
+        return 0
+
+    changed = 0
+    fixed_rows = []
+
+    # First pass: determine if we need to rewrite at all
+    needs_rewrite = False
+
+    for r in rows:
+        if _row_has_surplus_columns(r):
+            needs_rewrite = True
+
+        # Ensure keys exist
+        for k in fieldnames:
+            if k not in r:
+                r[k] = ""
+                needs_rewrite = True
+
+        # Normalize labels_json
+        lj_raw = r.get("labels_json", "")
+        lj_norm = _normalize_labels_json(lj_raw)
+        if lj_norm is None:
+            # As a last resort, try to extract labels from best-effort regex over the raw row text
+            # (only if labels_json is empty/broken)
+            if lj_raw and not needs_rewrite:
+                needs_rewrite = True
+        else:
+            if lj_norm != str(lj_raw).strip():
+                r["labels_json"] = lj_norm
+                needs_rewrite = True
+                changed += 1
+
+        # Recompute value_prob if missing
+        vp = (r.get("value_prob") or "").strip()
+        ya = (r.get("yes_ask_prob") or "").strip()
+        mp = (r.get("model_prob") or "").strip()
+        if (not vp) and ya and mp:
+            try:
+                r["value_prob"] = f"{(float(mp) - float(ya)):.6f}"
+                needs_rewrite = True
+                changed += 1
+            except Exception:
+                pass
+
+        # Default strategy if empty
+        if (r.get("strategy") is None) or (str(r.get("strategy")).strip() == ""):
+            r["strategy"] = "lock_0930"
+            needs_rewrite = True
+            changed += 1
+
+        # Drop any surplus columns
+        if None in r:
+            r.pop(None, None)
+        if "" in r:
+            r.pop("", None)
+
+        # Keep only desired keys (stable order)
+        fixed_rows.append({
+            k: ("" if r.get(k) is None else (str(r.get(k)) if k == "labels_json" else str(r.get(k)).strip()))
+            for k in fieldnames
+        })
+
+    if not needs_rewrite:
+        return 0
+
+    # Backup before rewriting
+    try:
+        raw_text = PERF_CSV.read_text(encoding="utf-8", errors="replace")
+        backup = PERF_CSV.with_suffix(".csv.bak." + datetime.now(TZ).strftime("%Y%m%d-%H%M%S"))
+        backup.write_text(raw_text, encoding="utf-8")
+    except Exception:
+        pass
+
+    tmp = PERF_CSV.with_suffix(".csv.tmp")
+    with tmp.open("w", newline="", encoding="utf-8") as f:
+        # Ignore any unexpected keys (e.g., DictReader surplus columns stored under None)
+        w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        w.writeheader()
+        for r in fixed_rows:
+            w.writerow(r)
+
+    tmp.replace(PERF_CSV)
+    return changed
 
 def perf_update_outcomes():
-    """
-    For rows with blank outcomes and date < today, fetch observed daily high and compute results.
+    """Update outcomes for any past dates that are missing observed_high_f.
+
+    Uses csv.DictReader/DictWriter so labels_json (commas) is handled safely.
     """
     if not PERF_CSV.exists():
         return
 
-    lines = PERF_CSV.read_text(encoding="utf-8").splitlines()
-    if len(lines) < 2:
-        return
-
-    header = lines[0]
-    out = [header]
     today = _today_local_date_str()
 
-    for line in lines[1:]:
-        if not line.strip():
-            continue
-        parts = line.split(",")
-        # Expected columns:
-        # 0 date,1 city,2 station,3 sigma_f,4 labels_json,5 best_contract,6 yes_ask_prob,7 model_prob,8 value_prob,
-        # 9 observed_high_f,10 winning_contract,11 won,12 profit
-        # If we already have observed_high_f filled, keep line
-        if len(parts) < 13:
-            out.append(line)
+    with PERF_CSV.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames or []
+        if not fieldnames:
+            return
+        rows = list(reader)
+
+    # Ensure required columns exist
+    required = ["observed_high_f", "winning_contract", "won", "profit", "strategy"]
+    for c in required:
+        if c not in fieldnames:
+            fieldnames.append(c)
+
+    changed = False
+
+    for row in rows:
+        date_s = (row.get("date") or "").strip()
+        if not date_s:
             continue
 
-        date_s = parts[0]
-        station = parts[2]
-
-        observed = parts[9].strip()
-        if observed or date_s >= today:
-            out.append(line)
+        if (row.get("observed_high_f") or "").strip():
             continue
 
-        # Load labels list back
+        station = (row.get("station") or "").strip() or STATION
+
+        # labels_json: try normal JSON, then legacy repair
+        labels = []
+        raw = row.get("labels_json")
+        if raw:
+            try:
+                obj = json.loads(raw)
+                if isinstance(obj, list):
+                    labels = obj
+                elif isinstance(obj, str):
+                    labels = json.loads(obj)
+            except Exception:
+                fixed = _repair_legacy_labels_json(raw)
+                if fixed:
+                    try:
+                        labels = json.loads(fixed)
+                        row["labels_json"] = fixed
+                        changed = True
+                    except Exception:
+                        labels = []
+
+        # Fetch observed high
         try:
-            labels_json_escaped = parts[4]
-            labels_json = json.loads(labels_json_escaped)   # this returns a JSON string
-            labels = json.loads(labels_json)               # this returns the list
-        except Exception:
-            labels = []
-
-        # Fetch observed high for that station/date
-        try:
-            # temporarily swap station for fetch
             old_station = globals().get("STATION", station)
             globals()["STATION"] = station
             obs_high = _fetch_observed_daily_high(date_s)
@@ -858,14 +1194,28 @@ def perf_update_outcomes():
         except Exception:
             obs_high = None
 
+        # Intraday finalization:
+        # If observed high already exceeds all remaining bucket bounds,
+        # the outcome is final even before end-of-day.
+        try:
+            labels_intraday = json.loads(row.get("labels_json", "[]"))
+            max_bucket_hi = None
+            for lab in labels_intraday:
+                lo, hi = _parse_bucket_label(lab)
+                if hi is not None:
+                    max_bucket_hi = hi if max_bucket_hi is None else max(max_bucket_hi, hi)
+            if max_bucket_hi is not None and obs_high is not None and obs_high >= max_bucket_hi:
+                pass  # outcome is final, continue processing
+        except Exception:
+            pass
+
         if obs_high is None:
-            out.append(line)
             continue
 
         winning = _resolve_winning_label(labels, obs_high) or ""
 
-        best_contract = parts[5]
-        yes_ask_prob = parts[6].strip()
+        best_contract = (row.get("best_contract") or "").strip()
+        yes_ask_prob = (row.get("yes_ask_prob") or "").strip()
         try:
             price = float(yes_ask_prob) if yes_ask_prob else None
         except Exception:
@@ -875,24 +1225,43 @@ def perf_update_outcomes():
 
         profit = ""
         if price is not None:
-            # Simple YES at ask: + (1 - price) if win else -price
             profit_val = (1.0 - price) if won == "1" else (-price)
             profit = f"{profit_val:.6f}"
 
-        parts[9] = f"{float(obs_high):.1f}"
-        parts[10] = winning
-        parts[11] = won
-        parts[12] = profit
+        row["observed_high_f"] = f"{float(obs_high):.1f}"
+        row["winning_contract"] = winning
+        row["won"] = won
+        row["profit"] = profit
+        if "strategy" not in row or row.get("strategy") is None:
+            row["strategy"] = ""
 
-        out.append(",".join(parts))
+        changed = True
 
-    PERF_CSV.write_text("\n".join(out) + "\n", encoding="utf-8")
+    if not changed:
+        return
+
+    with PERF_CSV.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for r in rows:
+            for c in fieldnames:
+                if c not in r:
+                    r[c] = ""
+            writer.writerow(r)
 
 def perf_load_df():
+    import pandas as pd
+
     if not PERF_CSV.exists():
         _ensure_perf_header()
-        return pd.read_csv(PERF_CSV)
-    return pd.read_csv(PERF_CSV)
+        df = pd.read_csv(PERF_CSV)
+    else:
+        df = pd.read_csv(PERF_CSV)
+
+    # Back-compat: ensure strategy exists
+    if "strategy" not in df.columns:
+        df["strategy"] = ""
+    return df
 
 # -----------------------
 # Hourly forecast (NWS) for plotting

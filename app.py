@@ -3,6 +3,9 @@ import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 import altair as alt
 import philly_edge as pe
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+import os
 
 st.set_page_config(page_title="Weather Edge", layout="centered")
 
@@ -46,6 +49,30 @@ def value_color(v):
     if v is None or (isinstance(v, float) and pd.isna(v)):
         return ""
     return "color: #22c55e;" if v > 0 else "color: #ef4444;"
+
+# -----------------------
+# Lock times (global): 9:30 CST and 12:00 CST
+# -----------------------
+LOCK_TZ = ZoneInfo("America/Chicago")
+LOCK_HOUR = 9
+LOCK_MIN = 30
+LOCK2_HOUR = 12
+LOCK2_MIN = 0
+
+def now_cst():
+    return datetime.now(tz=LOCK_TZ)
+
+def lock_date_str_cst():
+    return now_cst().strftime("%Y-%m-%d")
+
+def is_after_lock_cst():
+    n = now_cst()
+    return (n.hour, n.minute) >= (LOCK_HOUR, LOCK_MIN)
+
+def is_after_lock2_cst():
+    n = now_cst()
+    return (n.hour, n.minute) >= (LOCK2_HOUR, LOCK2_MIN)
+
 
 def render_overall_best_bet(snapshot_tables: dict):
     """Render a single global best-bet banner scanning ALL buckets across ALL cities."""
@@ -96,7 +123,7 @@ def render_overall_best_bet(snapshot_tables: dict):
         st.caption(f"Model {float(model):.1f}% vs Market {float(yes_ask):.1f}%")
 
     if val > 0:
-        st.success(f"Top pick: **{city} — {contract}** (edge **+{val:.1f}%**)")
+        st.success(f"Top pick: **{city} — {contract}** (edge **+{val:.1f}%**)" )
     else:
         st.warning(f"No positive edge right now. Best available is **{city} — {contract}** ({val:+.1f}%).")
 
@@ -160,28 +187,113 @@ def compute_city_snapshot(city_name: str):
     return df, best, sigma, labels
 
 # -----------------------
-# Build leaderboard
+# Build leaderboard + logging
 # -----------------------
 leader_rows = []
 snapshots = {}
+
+# Prepare lock directory and lock file paths (two lock times)
+lock_dir = os.path.join("data", "locks")
+os.makedirs(lock_dir, exist_ok=True)
+
+lock_file_0930 = os.path.join(lock_dir, f"LOCKED_0930_{lock_date_str_cst()}_CST.txt")
+lock_file_1200 = os.path.join(lock_dir, f"LOCKED_1200_{lock_date_str_cst()}_CST.txt")
+
+locked_0930 = os.path.isfile(lock_file_0930)
+locked_1200 = os.path.isfile(lock_file_1200)
+
+after_0930 = is_after_lock_cst()
+after_1200 = is_after_lock2_cst()
+
+DO_LOCK_0930 = False
+DO_LOCK_1200 = False
+
+if after_0930 and not locked_0930:
+    try:
+        with open(lock_file_0930, "w") as f:
+            f.write(f"Locked picks for {lock_date_str_cst()} 09:30 CST\n")
+        DO_LOCK_0930 = True
+    except Exception:
+        DO_LOCK_0930 = False
+
+if after_1200 and not locked_1200:
+    try:
+        with open(lock_file_1200, "w") as f:
+            f.write(f"Locked picks for {lock_date_str_cst()} 12:00 CST\n")
+        DO_LOCK_1200 = True
+    except Exception:
+        DO_LOCK_1200 = False
 
 for city_name in CITIES.keys():
     df, best, sigma, labels = compute_city_snapshot(city_name)
     snapshots[city_name] = (df, sigma, labels)
 
-    # Log today's snapshot (deduped per city/day) if tracking is present
-    if hasattr(pe, "perf_log_snapshot") and best is not None:
-        pe.perf_log_snapshot(
-            date_s=pe._today_local_date_str(),
-            city=city_name,
-            station=CITIES[city_name]["station_obs"],
-            sigma_f=sigma,
-            labels=labels,
-            best_contract=best.get("Contract"),
-            yes_ask_prob=(best.get("YES ask %")/100.0 if best.get("YES ask %") is not None else None),
-            model_prob=(best.get("Model %")/100.0 if best.get("Model %") is not None else None),
-            value_prob=(best.get("Value %")/100.0 if best.get("Value %") is not None else None),
-        )
+    # Append snapshot row for each city if possible
+    if hasattr(pe, "snap_append_row") and df is not None and not df.empty:
+        cand = df.dropna(subset=["Value %"]).copy()
+        if len(cand):
+            top_city = cand.sort_values("Value %", ascending=False).iloc[0]
+            ts_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            ts_local = now_cst().strftime("%Y-%m-%d %H:%M:%S")
+            date_local = lock_date_str_cst()
+            station = CITIES[city_name]["station_obs"]
+
+            yes_ask_prob = (float(top_city["YES ask %"]) / 100.0) if pd.notna(top_city["YES ask %"]) else None
+            model_prob = (float(top_city["Model %"]) / 100.0) if pd.notna(top_city["Model %"]) else None
+            value_prob = (float(top_city["Value %"]) / 100.0) if pd.notna(top_city["Value %"]) else None
+            volume = top_city.get("Volume", None)
+
+            try:
+                pe.snap_append_row(
+                    ts_utc=ts_utc,
+                    ts_local=ts_local,
+                    date_local=date_local,
+                    city=city_name,
+                    station=station,
+                    sigma_f=float(sigma),
+                    contract=str(top_city["Contract"]),
+                    yes_ask_prob=yes_ask_prob,
+                    model_prob=model_prob,
+                    value_prob=value_prob,
+                    volume=volume,
+                )
+            except Exception:
+                pass
+
+    # Log official (graded) picks at lock times once per day (9:30 CST and 12:00 CST)
+    if DO_LOCK_0930 and hasattr(pe, "perf_log_snapshot") and best is not None:
+        try:
+            pe.perf_log_snapshot(
+                date_s=pe._today_local_date_str(),
+                city=city_name,
+                station=CITIES[city_name]["station_obs"],
+                sigma_f=sigma,
+                labels=labels,
+                best_contract=best.get("Contract"),
+                yes_ask_prob=(best.get("YES ask %")/100.0 if best.get("YES ask %") is not None else None),
+                model_prob=(best.get("Model %")/100.0 if best.get("Model %") is not None else None),
+                value_prob=(best.get("Value %")/100.0 if best.get("Value %") is not None else None),
+                strategy="lock_0930",
+            )
+        except Exception:
+            pass
+
+    if DO_LOCK_1200 and hasattr(pe, "perf_log_snapshot") and best is not None:
+        try:
+            pe.perf_log_snapshot(
+                date_s=pe._today_local_date_str(),
+                city=city_name,
+                station=CITIES[city_name]["station_obs"],
+                sigma_f=sigma,
+                labels=labels,
+                best_contract=best.get("Contract"),
+                yes_ask_prob=(best.get("YES ask %")/100.0 if best.get("YES ask %") is not None else None),
+                model_prob=(best.get("Model %")/100.0 if best.get("Model %") is not None else None),
+                value_prob=(best.get("Value %")/100.0 if best.get("Value %") is not None else None),
+                strategy="lock_1200",
+            )
+        except Exception:
+            pass
 
     if best is None:
         leader_rows.append({
@@ -262,7 +374,7 @@ else:
     except Exception:
         pass
 
-    # Two charts: past 12h observed + next 12h forecast
+# Two charts: past 12h observed + next 12h forecast
 try:
     apply_city(cfg)
 
