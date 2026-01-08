@@ -83,6 +83,42 @@ def fmt_american(o):
         return ""
     return f"+{o}" if o > 0 else str(o)
 
+def market_lock_info(df: pd.DataFrame, best_contract=None):
+    """Detect when the market is essentially 'locked' (one contract ~certain).
+
+    Returns:
+        (status_str, dominant_contract, dominant_yes_ask_pct, is_locked, is_not_viable)
+    """
+    if df is None or getattr(df, "empty", True) or ("YES ask %" not in df.columns) or ("Contract" not in df.columns):
+        return ("", None, None, False, False)
+
+    s = pd.to_numeric(df["YES ask %"], errors="coerce")
+    if s.isna().all():
+        return ("", None, None, False, False)
+
+    top_idx = int(s.idxmax())
+    top_val = float(s.loc[top_idx])
+    top_contract = str(df.loc[top_idx, "Contract"])
+
+    s2 = s.drop(index=top_idx)
+    second_val = float(s2.max()) if len(s2) else float("nan")
+
+    # "Locked" heuristic: one contract >= 97.5% AND gap to #2 >= 90 points
+    is_locked = (top_val >= 97.5) and (pd.isna(second_val) or (top_val - second_val >= 90.0))
+
+    # If locked and our "best" is NOT the dominant contract, it's effectively not viable
+    is_not_viable = bool(is_locked and best_contract and (str(best_contract) != top_contract))
+
+    if is_not_viable:
+        status = "⛔ Not viable (market locked)"
+    elif is_locked:
+        status = "🔒 Market locked"
+    else:
+        status = "Live"
+
+    return (status, top_contract, top_val, is_locked, is_not_viable)
+
+
 def value_color(v):
     if v is None or (isinstance(v, float) and pd.isna(v)):
         return ""
@@ -113,51 +149,78 @@ def is_after_lock2_cst():
 
 
 def render_overall_best_bet(snapshot_tables: dict):
-    """Render a single global best-bet banner scanning ALL buckets across ALL cities."""
-    # Banner-style header
+    """Render a single global best-bet banner scanning ALL buckets across ALL cities.
+    Accuracy-first, lightly market-blended; Value% used only for tiebreaks.
+    """
+
+    # weights
+    W_MODEL = 0.90   # primary: model win-probability
+    W_MKT = 0.10     # secondary: market wisdom (YES ask)
+
     st.markdown(
         """
         <div style="padding:14px 16px;border-radius:14px;border:1px solid rgba(255,255,255,0.10);background:rgba(255,255,255,0.03);">
-          <div style="font-size:14px;opacity:0.75;margin-bottom:6px;">Overall best bet (accuracy-first)</div>
+          <div style="font-size:14px;opacity:0.75;margin-bottom:6px;">Overall best bet (accuracy-first, market-blended)</div>
         """,
         unsafe_allow_html=True,
     )
 
     best = None
+
     for city, df in snapshot_tables.items():
         if df is None or getattr(df, "empty", True):
             continue
         if ("Model %" not in df.columns) or ("YES ask %" not in df.columns):
             continue
 
-        cand = df.dropna(subset=["Model %", "YES ask %"]).copy()
+        # If the market is effectively locked, only the dominant contract is 'viable'
+        status, dom_contract, dom_yes, is_locked, _ = market_lock_info(df)
+        df_use = df
+        if is_locked and dom_contract:
+            df_use = df[df["Contract"].astype(str) == str(dom_contract)].copy()
+
+        cand = df_use.dropna(subset=["Model %", "YES ask %"]).copy()
         if cand.empty:
             continue
 
-        cand["_model_p"] = cand["Model %"].astype(float) / 100.0
-        cand["_mkt_p"] = cand["YES ask %"].astype(float) / 100.0
-        cand["_score"] = 0.85 * cand["_model_p"] + 0.15 * cand["_mkt_p"]
+        # probabilities 0..1
+        cand["_model_p"] = pd.to_numeric(cand["Model %"], errors="coerce") / 100.0
+        cand["_mkt_p"] = pd.to_numeric(cand["YES ask %"], errors="coerce") / 100.0
+        cand = cand.dropna(subset=["_model_p", "_mkt_p"]).copy()
+        if cand.empty:
+            continue
 
-        if "Value %" not in cand.columns:
-            cand["Value %"] = float("nan")
+        # accuracy-first score (market-blended)
+        cand["_acc_score"] = (W_MODEL * cand["_model_p"]) + (W_MKT * cand["_mkt_p"])
 
-        top_city = cand.sort_values(["_score", "Value %"], ascending=[False, False]).iloc[0]
-        score = float(top_city["_score"])
-        val = float(top_city["Value %"]) if pd.notna(top_city["Value %"]) else float("nan")
+        # value tiebreak (0 if missing)
+        if "Value %" in cand.columns:
+            cand["_value_p"] = pd.to_numeric(cand["Value %"], errors="coerce").fillna(0.0) / 100.0
+        else:
+            cand["_value_p"] = 0.0
 
-        if (
-            (best is None)
-            or (score > best["score"])
-            or (score == best["score"] and (pd.isna(best["value"]) or (not pd.isna(val) and val > best["value"])))
-        ):
-            best = {
-                "city": city,
-                "contract": str(top_city.get("Contract", "")),
-                "value": val,
-                "yes_ask": top_city.get("YES ask %"),
-                "model": top_city.get("Model %"),
-                "score": score,
-            }
+        # top row for this city: best acc_score, then model_p, then value_p
+        top_city = cand.sort_values(
+            ["_acc_score", "_model_p", "_value_p"],
+            ascending=[False, False, False],
+        ).iloc[0]
+
+        # choose best across cities with same ordering
+        if best is None:
+            best = {"city": city, "row": top_city, "status": status}
+        else:
+            b = best["row"]
+            a = top_city
+            if (
+                (a["_acc_score"] > b["_acc_score"])
+                or (a["_acc_score"] == b["_acc_score"] and a["_model_p"] > b["_model_p"])
+                or (
+                    a["_acc_score"] == b["_acc_score"]
+                    and a["_model_p"] == b["_model_p"]
+                    and a["_value_p"] > b["_value_p"]
+                )
+            ):
+                best = {"city": city, "row": top_city, "status": status}
 
     if best is None:
         st.markdown("</div>", unsafe_allow_html=True)
@@ -165,35 +228,52 @@ def render_overall_best_bet(snapshot_tables: dict):
         return
 
     city = best["city"]
-    contract = best["contract"]
-    val = best["value"]
-    yes_ask = best.get("yes_ask")
-    model = best.get("model")
+    row = best["row"]
 
-    # Compact 1-row summary
+    contract = str(row.get("Contract", ""))
+    yes_ask = row.get("YES ask %")
+    model = row.get("Model %")
+
+    try:
+        acc_score = float(row.get("_acc_score", 0.0))
+    except Exception:
+        acc_score = 0.0
+
+    # Value% (display only)
+    try:
+        val = float(row.get("Value %"))
+    except Exception:
+        val = float("nan")
+
     c1, c2, c3 = st.columns([1.1, 2.1, 1.2])
     c1.metric("City", city)
     c2.metric("Contract", contract)
 
-    # Edge badge (green/red)
-    edge_txt = f"{val:+.1f}%"
-    edge_color = "#22c55e" if val > 0 else "#ef4444"
+    # Edge badge (green/red, neutral if missing)
+    if pd.isna(val):
+        edge_txt = "—"
+        edge_color = "#9ca3af"
+    else:
+        edge_txt = f"{val:+.1f}%"
+        edge_color = "#22c55e" if val > 0 else "#ef4444"
+
+    yes_txt = "" if pd.isna(yes_ask) else f"{float(yes_ask):.1f}%"
+    model_txt = "" if pd.isna(model) else f"{float(model):.1f}%"
+
     c3.markdown(
         f"""
         <div style="height:100%;display:flex;flex-direction:column;justify-content:center;align-items:flex-end;">
           <div style="font-size:12px;opacity:0.7;">Edge (Value %)</div>
           <div style="font-size:26px;font-weight:700;color:{edge_color};line-height:1;">{edge_txt}</div>
-          <div style="font-size:12px;opacity:0.7;margin-top:6px;">YES ask: {'' if pd.isna(yes_ask) else f'{float(yes_ask):.1f}%'} · Model: {'' if pd.isna(model) else f'{float(model):.1f}%'} · Score: {best['score']*100:.1f}%</div>
+          <div style="font-size:12px;opacity:0.7;margin-top:6px;">YES ask: {yes_txt} · Model: {model_txt} · Acc score: {acc_score*100:.1f}%</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    # Callout line
-    if val > 0:
-        st.success(f"Top pick: **{city} — {contract}** (edge **+{val:.1f}%**)" )
-    else:
-        st.warning(f"No positive edge right now. Best available is **{city} — {contract}** ({val:+.1f}%).")
+    status_str = best.get("status","")
+    extra = f" · {status_str}" if status_str else ""
+    st.success(f"Top pick: **{city} — {contract}** (accuracy-first score **{acc_score*100:.1f}%**){extra}")
 
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -230,10 +310,14 @@ if st.button("🔄 Refresh"):
 
 @st.cache_data(show_spinner=False)
 def compute_city_snapshot(city_name: str):
-    cfg = CITIES[city_name]
-    apply_city(cfg)
-    sigma = get_city_sigma(city_name)
-    
+    """
+    Returns:
+      df (DataFrame): per-bucket table (may be empty)
+      best (dict|None): best row by Value% (may be None)
+      sigma (float): calibrated sigma (best-effort)
+      labels (list): bucket labels (may be empty)
+      err (str): non-fatal error message for UI ("" if OK)
+    """
     cfg = CITIES[city_name]
     apply_city(cfg)
     sigma = get_city_sigma(city_name)
@@ -333,7 +417,7 @@ if after_1200 and not locked_1200:
 
 for city_name in CITIES.keys():
     df, best, sigma, labels, err = compute_city_snapshot(city_name)
-    snapshots[city_name] = (df, sigma, labels, err)
+    snapshots[city_name] = (df, best, sigma, labels, err)
 
     # Append snapshot row for each city if possible
     if hasattr(pe, "snap_append_row") and df is not None and not df.empty:
@@ -406,6 +490,10 @@ for city_name in CITIES.keys():
         leader_rows.append({
             "City": city_name,
             "Best contract": "(no market data)",
+            "Status": "No data" if err else "",
+            "Not viable": False,
+            "Dominant": "",
+            "Dominant YES %": None,
             "Value %": None,
             "YES ask %": None,
             "Model %": None,
@@ -413,9 +501,14 @@ for city_name in CITIES.keys():
             "σ": sigma,
         })
     else:
+        status, dom_contract, dom_yes, is_locked, is_not_viable = market_lock_info(df, best_contract=best.get("Contract"))
         leader_rows.append({
             "City": city_name,
             "Best contract": best.get("Contract"),
+            "Status": status,
+            "Not viable": bool(is_not_viable),
+            "Dominant": dom_contract if dom_contract else "",
+            "Dominant YES %": (float(dom_yes) if dom_yes is not None else None),
             "Value %": best.get("Value %"),
             "YES ask %": best.get("YES ask %"),
             "Model %": best.get("Model %"),
@@ -427,6 +520,8 @@ load_status.empty()
 
 lb = pd.DataFrame(leader_rows)
 lb["_sort"] = lb["Value %"].fillna(-1e18)
+# Demote non-viable (market-locked elsewhere) rows
+lb.loc[lb.get("Not viable", False) == True, "_sort"] = -1e18
 lb = lb.sort_values("_sort", ascending=False).drop(columns=["_sort"])
 
 snapshot_tables = {city: snapshots[city][0] for city in snapshots}
@@ -434,16 +529,20 @@ with best_bet_slot:
     render_overall_best_bet(snapshot_tables)
 
 # Show any non-fatal data errors so the page doesn't look "blank" when an API call fails
-errs = {c: snapshots[c][3] for c in snapshots if len(snapshots[c]) > 3 and snapshots[c][3]}
+errs = {c: snapshots[c][4] for c in snapshots if len(snapshots[c]) > 3 and snapshots[c][4]}
 if errs:
     st.warning(
         "Some live data calls failed (the app will still load):\n"
         + "\n".join([f"- {c}: {m}" for c, m in errs.items()])
     )
 
+# Display-friendly leaderboard (hide internal helper cols)
+cols = ["City","Best contract","Status","Dominant","Dominant YES %","Value %","YES ask %","Model %","Odds","σ"]
+lb_show = lb[[c for c in cols if c in lb.columns]].copy()
+
 styled_lb = (
-    lb.style
-      .format({"Value %": "{:+.1f}%", "YES ask %": "{:.1f}%", "Model %": "{:.1f}%", "σ": "{:.2f}"})
+    lb_show.style
+      .format({"Dominant YES %": "{:.1f}%", "Value %": "{:+.1f}%", "YES ask %": "{:.1f}%", "Model %": "{:.1f}%", "σ": "{:.2f}"})
       .map(value_color, subset=["Value %"])
 )
 
@@ -461,12 +560,32 @@ default_city = (
 )
 city_pick = st.selectbox("Select a city", lb["City"].tolist(), index=list(lb["City"]).index(default_city))
 
-df_city, sigma_city, _labels_city, err_city = snapshots[city_pick]
+df_city, best_city, sigma_city, _labels_city, err_city = snapshots[city_pick]
 cfg = CITIES[city_pick]
 st.caption(f"Settlement station: {cfg['station_label']}")
 
 if err_city:
     st.warning(f"{city_pick} live data error: {err_city}")
+
+# Market lock / viability indicator
+best_contract_city = best_city.get("Contract") if isinstance(best_city, dict) else None
+status_mkt, dom_contract, dom_yes, is_locked, is_not_viable = market_lock_info(df_city, best_contract=best_contract_city)
+if status_mkt:
+    dom_txt = (f" · Dominant: {dom_contract} ({float(dom_yes):.1f}% YES ask)" if dom_contract and dom_yes is not None else "")
+    st.caption(f"Market status: {status_mkt}{dom_txt}")
+if is_not_viable:
+    st.warning(
+        f"This city's Value% pick is **not viable** because the market is locked to **{dom_contract}** (~{float(dom_yes):.1f}% YES ask)."
+    )
+
+# Market lock / viability indicator
+best_contract_city = best_city.get('Contract') if isinstance(best_city, dict) else None
+status_mkt, dom_contract, dom_yes, is_locked, is_not_viable = market_lock_info(df_city, best_contract=best_contract_city)
+if status_mkt:
+    dom_txt = (f" · Dominant: {dom_contract} ({float(dom_yes):.1f}% YES ask)" if dom_contract and dom_yes is not None else "")
+    st.caption(f"Market status: {status_mkt}{dom_txt}")
+if is_not_viable:
+    st.warning(f"Not viable right now: market is locked to **{dom_contract}** (~{float(dom_yes):.1f}% YES ask).")
 
 if df_city is None or df_city.empty:
     st.info("No bucket data returned right now for this city.")
