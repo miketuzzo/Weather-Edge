@@ -1,7 +1,6 @@
-.venv/
-__pycache__/
-.DS_Store
-*.pem
-*.key
-*.env
-.kalshi/
+# local shell
+.zshrc
+
+# runtime data + backups
+data/locks/
+data/performance.csv.bak.*
