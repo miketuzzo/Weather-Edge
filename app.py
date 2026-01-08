@@ -1,3 +1,4 @@
+
 import pandas as pd
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
@@ -6,6 +7,12 @@ import philly_edge as pe
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 import os
+
+# Make charts crisp on Safari/mobile (avoid blurry canvas scaling)
+try:
+    alt.renderers.set_embed_options(renderer="svg")
+except Exception:
+    pass
 
 st.set_page_config(page_title="Weather Edge", layout="centered")
 
@@ -76,7 +83,14 @@ def is_after_lock2_cst():
 
 def render_overall_best_bet(snapshot_tables: dict):
     """Render a single global best-bet banner scanning ALL buckets across ALL cities."""
-    st.subheader("Overall best bet (right now)")
+    # Banner-style header
+    st.markdown(
+        """
+        <div style="padding:14px 16px;border-radius:14px;border:1px solid rgba(255,255,255,0.10);background:rgba(255,255,255,0.03);">
+          <div style="font-size:14px;opacity:0.75;margin-bottom:6px;">Overall best bet (right now)</div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     best = None
 
@@ -90,7 +104,6 @@ def render_overall_best_bet(snapshot_tables: dict):
         if cand.empty:
             continue
 
-        # Pick best bucket within this city
         top_city = cand.sort_values("Value %", ascending=False).iloc[0]
         val = float(top_city["Value %"])
 
@@ -104,6 +117,7 @@ def render_overall_best_bet(snapshot_tables: dict):
             }
 
     if best is None:
+        st.markdown("</div>", unsafe_allow_html=True)
         st.info("No market data available yet.")
         return
 
@@ -113,25 +127,39 @@ def render_overall_best_bet(snapshot_tables: dict):
     yes_ask = best.get("yes_ask")
     model = best.get("model")
 
-    c1, c2, c3, c4 = st.columns(4)
+    # Compact 1-row summary
+    c1, c2, c3 = st.columns([1.1, 2.1, 1.2])
     c1.metric("City", city)
     c2.metric("Contract", contract)
-    c3.metric("Edge (Value %)", f"{val:+.1f}%")
-    c4.metric("Price (YES ask)", ("{:.1f}%".format(yes_ask) if pd.notna(yes_ask) else ""))
 
-    if pd.notna(model) and pd.notna(yes_ask):
-        st.caption(f"Model {float(model):.1f}% vs Market {float(yes_ask):.1f}%")
+    # Edge badge (green/red)
+    edge_txt = f"{val:+.1f}%"
+    edge_color = "#22c55e" if val > 0 else "#ef4444"
+    c3.markdown(
+        f"""
+        <div style="height:100%;display:flex;flex-direction:column;justify-content:center;align-items:flex-end;">
+          <div style="font-size:12px;opacity:0.7;">Edge (Value %)</div>
+          <div style="font-size:26px;font-weight:700;color:{edge_color};line-height:1;">{edge_txt}</div>
+          <div style="font-size:12px;opacity:0.7;margin-top:6px;">YES ask: {'' if pd.isna(yes_ask) else f'{float(yes_ask):.1f}%'} · Model: {'' if pd.isna(model) else f'{float(model):.1f}%'} </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
+    # Callout line
     if val > 0:
         st.success(f"Top pick: **{city} — {contract}** (edge **+{val:.1f}%**)" )
     else:
         st.warning(f"No positive edge right now. Best available is **{city} — {contract}** ({val:+.1f}%).")
+
+    st.markdown("</div>", unsafe_allow_html=True)
 
 # -----------------------
 # Manual refresh
 # -----------------------
 st.markdown("## Weather Edge — Multi-City (Daily High)")
 st.caption("Leaderboard ranks cities by their best Value% (highest → lowest). Settlement station shown in City view.")
+best_bet_slot = st.container()
 
 # Update outcomes for past days (historical tracking)
 if hasattr(pe, "perf_update_outcomes"):
@@ -321,7 +349,8 @@ lb["_sort"] = lb["Value %"].fillna(-1e18)
 lb = lb.sort_values("_sort", ascending=False).drop(columns=["_sort"])
 
 snapshot_tables = {city: snapshots[city][0] for city in snapshots}
-render_overall_best_bet(snapshot_tables)
+with best_bet_slot:
+    render_overall_best_bet(snapshot_tables)
 
 styled_lb = (
     lb.style
