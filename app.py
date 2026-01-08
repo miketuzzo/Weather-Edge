@@ -8,6 +8,37 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 import os
 
+# --- Deploy check (confirms Streamlit redeployed your latest push) ---
+APP_LOADED_UTC = datetime.now(timezone.utc)
+
+def _read_text(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+def get_git_sha_short() -> str:
+    # 1) CI env vars (works on some deploy setups)
+    for k in ("GITHUB_SHA", "COMMIT_SHA", "RENDER_GIT_COMMIT", "VERCEL_GIT_COMMIT_SHA"):
+        v = os.getenv(k, "").strip()
+        if v:
+            return v[:7]
+
+    # 2) Try reading .git (works on many Streamlit Cloud deployments)
+    head = _read_text(".git/HEAD")
+    if head.startswith("ref:"):
+        ref = head.split(" ", 1)[1].strip()
+        sha = _read_text(f".git/{ref}")
+        if sha:
+            return sha[:7]
+    elif len(head) >= 7:
+        return head[:7]
+
+    return ""
+
+DEPLOY_SHA = get_git_sha_short() or "unknown"
+
 # Make charts crisp on Safari/mobile (avoid blurry canvas scaling)
 try:
     alt.renderers.set_embed_options(renderer="svg")
@@ -87,33 +118,45 @@ def render_overall_best_bet(snapshot_tables: dict):
     st.markdown(
         """
         <div style="padding:14px 16px;border-radius:14px;border:1px solid rgba(255,255,255,0.10);background:rgba(255,255,255,0.03);">
-          <div style="font-size:14px;opacity:0.75;margin-bottom:6px;">Overall best bet (right now)</div>
+          <div style="font-size:14px;opacity:0.75;margin-bottom:6px;">Overall best bet (accuracy-first)</div>
         """,
         unsafe_allow_html=True,
     )
 
     best = None
-
     for city, df in snapshot_tables.items():
         if df is None or getattr(df, "empty", True):
             continue
-        if "Value %" not in df.columns:
+        if ("Model %" not in df.columns) or ("YES ask %" not in df.columns):
             continue
 
-        cand = df.dropna(subset=["Value %"]).copy()
+        cand = df.dropna(subset=["Model %", "YES ask %"]).copy()
         if cand.empty:
             continue
 
-        top_city = cand.sort_values("Value %", ascending=False).iloc[0]
-        val = float(top_city["Value %"])
+        cand["_model_p"] = cand["Model %"].astype(float) / 100.0
+        cand["_mkt_p"] = cand["YES ask %"].astype(float) / 100.0
+        cand["_score"] = 0.85 * cand["_model_p"] + 0.15 * cand["_mkt_p"]
 
-        if (best is None) or (val > best["value"]):
+        if "Value %" not in cand.columns:
+            cand["Value %"] = float("nan")
+
+        top_city = cand.sort_values(["_score", "Value %"], ascending=[False, False]).iloc[0]
+        score = float(top_city["_score"])
+        val = float(top_city["Value %"]) if pd.notna(top_city["Value %"]) else float("nan")
+
+        if (
+            (best is None)
+            or (score > best["score"])
+            or (score == best["score"] and (pd.isna(best["value"]) or (not pd.isna(val) and val > best["value"])))
+        ):
             best = {
                 "city": city,
                 "contract": str(top_city.get("Contract", "")),
                 "value": val,
                 "yes_ask": top_city.get("YES ask %"),
                 "model": top_city.get("Model %"),
+                "score": score,
             }
 
     if best is None:
@@ -140,7 +183,7 @@ def render_overall_best_bet(snapshot_tables: dict):
         <div style="height:100%;display:flex;flex-direction:column;justify-content:center;align-items:flex-end;">
           <div style="font-size:12px;opacity:0.7;">Edge (Value %)</div>
           <div style="font-size:26px;font-weight:700;color:{edge_color};line-height:1;">{edge_txt}</div>
-          <div style="font-size:12px;opacity:0.7;margin-top:6px;">YES ask: {'' if pd.isna(yes_ask) else f'{float(yes_ask):.1f}%'} · Model: {'' if pd.isna(model) else f'{float(model):.1f}%'} </div>
+          <div style="font-size:12px;opacity:0.7;margin-top:6px;">YES ask: {'' if pd.isna(yes_ask) else f'{float(yes_ask):.1f}%'} · Model: {'' if pd.isna(model) else f'{float(model):.1f}%'} · Score: {best['score']*100:.1f}%</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -154,12 +197,28 @@ def render_overall_best_bet(snapshot_tables: dict):
 
     st.markdown("</div>", unsafe_allow_html=True)
 
+@st.cache_data(show_spinner=False, ttl=6*60*60)
+def get_city_sigma(city_name: str) -> float:
+    """Calibrate sigma infrequently so the app doesn't hang on first load."""
+    cfg = CITIES[city_name]
+    apply_city(cfg)
+    try:
+        # fewer days = much faster
+        return float(pe.calibrate_sigma(days_back=5))
+    except Exception:
+        return 2.0
+
+
 # -----------------------
 # Manual refresh
 # -----------------------
 st.markdown("## Weather Edge — Multi-City (Daily High)")
 st.caption("Leaderboard ranks cities by their best Value% (highest → lowest). Settlement station shown in City view.")
+st.caption(f"Deploy check — commit `{DEPLOY_SHA}` · loaded {APP_LOADED_UTC.strftime('%Y-%m-%d %H:%M UTC')}")
 best_bet_slot = st.container()
+
+load_status = st.empty()
+load_status.info("Loading live markets… (first load can take ~10–20s)")
 
 # Update outcomes for past days (historical tracking)
 if hasattr(pe, "perf_update_outcomes"):
@@ -173,16 +232,32 @@ if st.button("🔄 Refresh"):
 def compute_city_snapshot(city_name: str):
     cfg = CITIES[city_name]
     apply_city(cfg)
+    sigma = get_city_sigma(city_name)
+    
+    cfg = CITIES[city_name]
+    apply_city(cfg)
+    sigma = get_city_sigma(city_name)
 
-    sigma = pe.calibrate_sigma(days_back=14)
+    # Fetch markets (can fail if env vars missing / API issues)
+    try:
+        bucket_markets = pe.get_today_bucket_markets()
+    except Exception as e:
+        empty = pd.DataFrame(columns=["Contract", "YES ask %", "Odds", "Volume", "Value %", "Model %"])
+        return empty, None, sigma, [], str(e)
 
-    bucket_markets = pe.get_today_bucket_markets()
     if not bucket_markets:
-        return None, None, sigma, []
+        empty = pd.DataFrame(columns=["Contract", "YES ask %", "Odds", "Volume", "Value %", "Model %"])
+        return empty, None, sigma, [], "No market data"
 
     labels = [bm["label"] for bm in bucket_markets]
     bucket_bounds = [(bm["label"], bm["lo"], bm["hi"]) for bm in bucket_markets]
-    probs = pe.model_probs_for_buckets(bucket_bounds, sigma)
+
+    # Model probabilities (best effort but should usually work)
+    try:
+        probs = pe.model_probs_for_buckets(bucket_bounds, sigma)
+    except Exception as e:
+        empty = pd.DataFrame(columns=["Contract", "YES ask %", "Odds", "Volume", "Value %", "Model %"])
+        return empty, None, sigma, labels, str(e)
 
     rows = []
     for bm in bucket_markets:
@@ -190,9 +265,13 @@ def compute_city_snapshot(city_name: str):
         m = bm["market"]
 
         p_model = float(probs.get(label, 0.0))
-        yes_ask = pe.yes_ask_prob(m)
-        vol = m.get("volume") or m.get("trade_volume") or m.get("volume_24h")
 
+        try:
+            yes_ask = pe.yes_ask_prob(m)  # 0..1 or None
+        except Exception:
+            yes_ask = None
+
+        vol = m.get("volume") or m.get("trade_volume") or m.get("volume_24h")
         value = None if yes_ask is None else (p_model - yes_ask)
         odds = american_odds_from_prob(yes_ask) if yes_ask is not None else None
 
@@ -212,7 +291,7 @@ def compute_city_snapshot(city_name: str):
     if len(cand):
         best = cand.sort_values("Value %", ascending=False).iloc[0].to_dict()
 
-    return df, best, sigma, labels
+    return df, best, sigma, labels, ""
 
 # -----------------------
 # Build leaderboard + logging
@@ -253,8 +332,8 @@ if after_1200 and not locked_1200:
         DO_LOCK_1200 = False
 
 for city_name in CITIES.keys():
-    df, best, sigma, labels = compute_city_snapshot(city_name)
-    snapshots[city_name] = (df, sigma, labels)
+    df, best, sigma, labels, err = compute_city_snapshot(city_name)
+    snapshots[city_name] = (df, sigma, labels, err)
 
     # Append snapshot row for each city if possible
     if hasattr(pe, "snap_append_row") and df is not None and not df.empty:
@@ -344,6 +423,8 @@ for city_name in CITIES.keys():
             "σ": sigma,
         })
 
+load_status.empty()
+
 lb = pd.DataFrame(leader_rows)
 lb["_sort"] = lb["Value %"].fillna(-1e18)
 lb = lb.sort_values("_sort", ascending=False).drop(columns=["_sort"])
@@ -351,6 +432,14 @@ lb = lb.sort_values("_sort", ascending=False).drop(columns=["_sort"])
 snapshot_tables = {city: snapshots[city][0] for city in snapshots}
 with best_bet_slot:
     render_overall_best_bet(snapshot_tables)
+
+# Show any non-fatal data errors so the page doesn't look "blank" when an API call fails
+errs = {c: snapshots[c][3] for c in snapshots if len(snapshots[c]) > 3 and snapshots[c][3]}
+if errs:
+    st.warning(
+        "Some live data calls failed (the app will still load):\n"
+        + "\n".join([f"- {c}: {m}" for c, m in errs.items()])
+    )
 
 styled_lb = (
     lb.style
@@ -372,9 +461,12 @@ default_city = (
 )
 city_pick = st.selectbox("Select a city", lb["City"].tolist(), index=list(lb["City"]).index(default_city))
 
-df_city, sigma_city, _labels_city = snapshots[city_pick]
+df_city, sigma_city, _labels_city, err_city = snapshots[city_pick]
 cfg = CITIES[city_pick]
 st.caption(f"Settlement station: {cfg['station_label']}")
+
+if err_city:
+    st.warning(f"{city_pick} live data error: {err_city}")
 
 if df_city is None or df_city.empty:
     st.info("No bucket data returned right now for this city.")
