@@ -4,3 +4,10 @@
 # runtime data + backups
 data/locks/
 data/performance.csv.bak.*
+
+# macOS junk
+.DS_Store
+**/.DS_Store
+
+# local virtualenv
+.venv/
