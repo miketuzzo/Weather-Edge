@@ -243,6 +243,16 @@ def render_overall_best_bet(snapshot_tables: dict):
     W_MODEL = 0.90   # primary: model win-probability
     W_MKT = 0.10     # secondary: market wisdom (YES ask)
 
+    # Per-city tables currently use "Forecast win %" (older versions used "Model %")
+    def _model_col(df_in: pd.DataFrame) -> Optional[str]:
+        if df_in is None:
+            return None
+        if "Model %" in df_in.columns:
+            return "Model %"
+        if "Forecast win %" in df_in.columns:
+            return "Forecast win %"
+        return None
+
     st.markdown(
         """
         <div style="padding:14px 16px;border-radius:14px;border:1px solid rgba(255,255,255,0.10);background:rgba(255,255,255,0.03);">
@@ -256,15 +266,16 @@ def render_overall_best_bet(snapshot_tables: dict):
     for city, df in snapshot_tables.items():
         if df is None or getattr(df, "empty", True):
             continue
-        if ("Model %" not in df.columns) or ("YES ask %" not in df.columns):
+        mcol = _model_col(df)
+        if (mcol is None) or ("YES ask %" not in df.columns):
             continue
 
-        cand = df.dropna(subset=["Model %", "YES ask %"]).copy()
+        cand = df.dropna(subset=[mcol, "YES ask %"]).copy()
         if cand.empty:
             continue
 
         # probabilities 0..1
-        cand["_model_p"] = pd.to_numeric(cand["Model %"], errors="coerce") / 100.0
+        cand["_model_p"] = pd.to_numeric(cand[mcol], errors="coerce") / 100.0
         cand["_mkt_p"] = pd.to_numeric(cand["YES ask %"], errors="coerce") / 100.0
         cand = cand.dropna(subset=["_model_p", "_mkt_p"]).copy()
         if cand.empty:
@@ -319,7 +330,7 @@ def render_overall_best_bet(snapshot_tables: dict):
 
     if best is None:
         st.markdown("</div>", unsafe_allow_html=True)
-        st.info("No market data available yet.")
+        st.info("No viable overall best bet right now (missing market/model data or markets are locked).")
         return
 
     city = best["city"]
@@ -327,7 +338,9 @@ def render_overall_best_bet(snapshot_tables: dict):
 
     contract = str(row.get("Contract", ""))
     yes_ask = row.get("YES ask %")
-    model = row.get("Model %")
+    # display the model column that exists
+    _mcol_best = _model_col(pd.DataFrame([row]))
+    model = row.get(_mcol_best) if _mcol_best else row.get("Forecast win %")
     odds_str = str(row.get("Odds", "") or "")
     longshot = is_odds_longshot(odds_str)
 
