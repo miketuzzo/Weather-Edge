@@ -894,37 +894,12 @@ if hasattr(pe, "perf_load_df"):
         st.dataframe(styled_out, width="stretch", hide_index=True)
 
         # ------------------------------------------------------------------
-        # Keep the detailed settled rows (optional but useful)
-        # ------------------------------------------------------------------
-        with st.expander("Show settled rows"):
-            done2 = done.copy()
-            done2 = done2.sort_values(["date", "strategy", "city"], ascending=[False, True, True])
-
-            # friendly percent columns
-            if "yes_ask_prob" in done2.columns:
-                done2["YES ask %"] = (pd.to_numeric(done2["yes_ask_prob"], errors="coerce") * 100).round(1)
-            if "model_prob" in done2.columns:
-                done2["Model %"] = (pd.to_numeric(done2["model_prob"], errors="coerce") * 100).round(1)
-            if "value_prob" in done2.columns:
-                done2["Value %"] = (pd.to_numeric(done2["value_prob"], errors="coerce") * 100).round(1)
-            done2["Profit %"] = (pd.to_numeric(done2["profit"], errors="coerce") * 100).round(2)
-
-            cols = [
-                c for c in [
-                    "date", "strategy", "city", "best_contract", "winning_contract",
-                    "observed_high_f", "YES ask %", "Model %", "Value %", "won", "Profit %"
-                ]
-                if c in done2.columns
-            ]
-            st.dataframe(done2[cols], width="stretch", hide_index=True)
-
-        # ------------------------------------------------------------------
-        # Keep city summary (still helpful)
+        # Combined: Performance by city + inline settled rows
         # ------------------------------------------------------------------
         st.subheader("Performance by city")
-        st.caption("Win% = % of locked picks that matched the winning contract.")
+        st.caption("Click a city to see its settled rows. Win% = % of locked picks that matched the winning contract.")
 
-        # Provide an overall view plus per-lock views
+        # Build a compact city summary table (Overall / by lock)
         tabs = st.tabs(["Overall", "09:30 CST", "12:00 CST"])
 
         def _city_summary(df_in: pd.DataFrame) -> pd.DataFrame:
@@ -955,14 +930,73 @@ if hasattr(pe, "perf_load_df"):
                     .applymap(_bg_win, subset=["Win%"])
             )
 
+        def _rows_for_city(df_in: pd.DataFrame, city_name: str) -> pd.DataFrame:
+            d = df_in[df_in["city"] == city_name].copy()
+            if d.empty:
+                return d
+            d = d.sort_values(["date", "strategy"], ascending=[False, True])
+
+            # friendly percent columns
+            if "yes_ask_prob" in d.columns:
+                d["YES ask %"] = (pd.to_numeric(d["yes_ask_prob"], errors="coerce") * 100).round(1)
+            if "model_prob" in d.columns:
+                d["Model %"] = (pd.to_numeric(d["model_prob"], errors="coerce") * 100).round(1)
+            if "value_prob" in d.columns:
+                d["Value %"] = (pd.to_numeric(d["value_prob"], errors="coerce") * 100).round(1)
+            if "profit" in d.columns:
+                d["Profit %"] = (pd.to_numeric(d["profit"], errors="coerce") * 100).round(2)
+
+            cols = [
+                c for c in [
+                    "date", "strategy", "best_contract", "winning_contract",
+                    "observed_high_f", "YES ask %", "Model %", "Value %", "won", "Profit %"
+                ]
+                if c in d.columns
+            ]
+            return d[cols]
+
+        def _render_city_panel(df_in: pd.DataFrame, label: str):
+            if df_in.empty:
+                st.info("No settled rows for this view yet.")
+                return
+
+            summ = _city_summary(df_in)
+            st.dataframe(_style_city(summ), width="stretch", hide_index=True)
+
+            # Pick a city and show its settled rows directly below
+            cities = summ["City"].tolist()
+            default_city = cities[0] if cities else None
+            city_pick2 = st.selectbox(
+                f"Show settled rows for a city ({label})",
+                options=cities,
+                index=0 if default_city else None,
+                key=f"hist_city_pick_{label}",
+            )
+
+            if not city_pick2:
+                return
+
+            rows = _rows_for_city(df_in, city_pick2)
+            if rows.empty:
+                st.caption("No settled rows for this city yet in this view.")
+                return
+
+            # Add quick W/L indicators per row
+            if "won" in rows.columns:
+                def _bg_won(v):
+                    if v is None or (isinstance(v, float) and pd.isna(v)):
+                        return ""
+                    return "background-color: rgba(34,197,94,0.18);" if float(v) >= 1.0 else "background-color: rgba(239,68,68,0.18);"
+
+                st.dataframe(rows.style.applymap(_bg_won, subset=["won"]), width="stretch", hide_index=True)
+            else:
+                st.dataframe(rows, width="stretch", hide_index=True)
+
         with tabs[0]:
-            df0 = _city_summary(done)
-            st.dataframe(_style_city(df0), width="stretch", hide_index=True)
+            _render_city_panel(done, "overall")
 
         with tabs[1]:
-            df1 = _city_summary(done[done["strategy"] == "lock_0930"].copy())
-            st.dataframe(_style_city(df1), width="stretch", hide_index=True)
+            _render_city_panel(done[done["strategy"] == "lock_0930"].copy(), "0930")
 
         with tabs[2]:
-            df2 = _city_summary(done[done["strategy"] == "lock_1200"].copy())
-            st.dataframe(_style_city(df2), width="stretch", hide_index=True)
+            _render_city_panel(done[done["strategy"] == "lock_1200"].copy(), "1200")
