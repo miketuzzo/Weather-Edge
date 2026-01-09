@@ -131,6 +131,45 @@ def fmt_american(o):
         return ""
     return f"+{o}" if o > 0 else str(o)
 
+# Odds guardrails:
+# - Exclude very expensive favorites (<= -300)
+# - Warn (but do NOT exclude) on big underdogs (>= +250)
+ODDS_EXCLUDE_FAVORITE_AT_OR_BELOW = -300
+ODDS_WARN_LONGSHOT_AT_OR_ABOVE = 250
+
+def is_odds_too_expensive(odds_str: Optional[str]) -> bool:
+    if not odds_str:
+        return False
+    try:
+        s = str(odds_str).strip()
+        # allow '+120' or '-250'
+        if s.startswith('+'):
+            return False
+        if s.startswith('-'):
+            val = int(s)
+            return val <= ODDS_EXCLUDE_FAVORITE_AT_OR_BELOW
+        # if it's somehow numeric without sign
+        val = int(s)
+        return val <= ODDS_EXCLUDE_FAVORITE_AT_OR_BELOW
+    except Exception:
+        return False
+
+
+# Warn on very large underdogs (longshots)
+def is_odds_longshot(odds_str: Optional[str]) -> bool:
+    """Return True if odds are a very large underdog (>= +250)."""
+    if not odds_str:
+        return False
+    try:
+        s = str(odds_str).strip()
+        if s.startswith('+'):
+            val = int(s[1:])
+            return val >= ODDS_WARN_LONGSHOT_AT_OR_ABOVE
+        # negative or unsigned numeric are not longshots in this sense
+        return False
+    except Exception:
+        return False
+
 def market_lock_info(df: pd.DataFrame, best_contract=None):
     """
     Detect when the market is essentially 'locked' (one contract ~certain).
@@ -229,11 +268,19 @@ def render_overall_best_bet(snapshot_tables: dict):
         if cand.empty:
             continue
 
-        # If market is locked, only the dominant contract is viable.
+        # Exclude "not worth betting" heavy favorites (odds <= -300)
+        if "Odds" in cand.columns:
+            cand = cand[~cand["Odds"].apply(is_odds_too_expensive)].copy()
+            if cand.empty:
+                continue
+
+        # If market is locked, the dominant contract is effectively decided.
+        # Treat it as "no longer a bet" and prefer the next-best non-dominant contract.
         _st, _dom, _dom_yes, _locked, _not_viable = market_lock_info(df, best_contract=None)
         if _locked and _dom is not None:
-            cand = cand[cand["Contract"].astype(str) == str(_dom)].copy()
+            cand = cand[cand["Contract"].astype(str) != str(_dom)].copy()
             if cand.empty:
+                # Nothing to bet anymore for this city
                 continue
 
         # accuracy-first score (market-blended)
@@ -279,6 +326,8 @@ def render_overall_best_bet(snapshot_tables: dict):
     contract = str(row.get("Contract", ""))
     yes_ask = row.get("YES ask %")
     model = row.get("Model %")
+    odds_str = str(row.get("Odds", "") or "")
+    longshot = is_odds_longshot(odds_str)
 
     try:
         acc_score = float(row.get("_acc_score", 0.0))
@@ -317,7 +366,16 @@ def render_overall_best_bet(snapshot_tables: dict):
         unsafe_allow_html=True,
     )
 
-    st.success(f"Top pick: **{city} — {contract}** (accuracy-first score **{acc_score*100:.1f}%**)")
+    msg = f"Top pick: **{city} — {contract}** (accuracy-first score **{acc_score*100:.1f}%**)"
+    if odds_str:
+        msg += f" · Odds: **{odds_str}**"
+    st.success(msg)
+
+    if longshot:
+        st.warning(
+            f"⚠️ Longshot odds (**{odds_str}**). High payout, lower hit-rate. "
+            f"Consider skipping unless you have a strong edge. (Warn threshold: +{ODDS_WARN_LONGSHOT_AT_OR_ABOVE})"
+        )
 
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -468,23 +526,28 @@ def compute_city_snapshot(city_name: str, fast: bool = False):
     status_str, dom_contract, dom_yes, is_locked, is_not_viable = market_lock_info(df, best_contract=None)
 
     # Pick logic
-    # 1) If market is locked, the only viable contract is the dominant one.
+    # If the market is locked (one contract ~certain), the dominant contract is effectively decided.
+    # Treat it as "not a bet" and choose the next-best contract that is NOT the dominant one.
     best = None
-    if is_locked and dom_contract is not None:
-        dom_rows = df[df["Contract"].astype(str) == str(dom_contract)]
-        if len(dom_rows):
-            best = dom_rows.iloc[0].to_dict()
-            best["Acc score %"] = None
+    locked_dom = str(dom_contract) if (is_locked and dom_contract is not None) else None
 
     # 2) Otherwise: accuracy-first, lightly market-blended.
     #    Score = 0.90*Model + 0.10*Market(YES ask). Value% only breaks ties.
     if best is None:
         cand = df.dropna(subset=["Model %", "YES ask %"]).copy()
+        # Exclude "not worth betting" heavy favorites (odds <= -300)
+        if "Odds" in cand.columns:
+            cand = cand[~cand["Odds"].apply(is_odds_too_expensive)].copy()
         if len(cand):
             cand["_model_p"] = pd.to_numeric(cand["Model %"], errors="coerce") / 100.0
             cand["_mkt_p"] = pd.to_numeric(cand["YES ask %"], errors="coerce") / 100.0
             cand["_value_p"] = pd.to_numeric(cand.get("Value %", 0.0), errors="coerce").fillna(0.0) / 100.0
             cand = cand.dropna(subset=["_model_p", "_mkt_p"]).copy()
+            # If market is locked, skip the dominant (already-decided) contract
+            if locked_dom is not None:
+                cand = cand[cand["Contract"].astype(str) != locked_dom].copy()
+            if cand.empty:
+                best = None
             if len(cand):
                 cand["_acc"] = 0.90 * cand["_model_p"] + 0.10 * cand["_mkt_p"]
                 top = cand.sort_values(["_acc", "_model_p", "_value_p"], ascending=[False, False, False]).iloc[0]
@@ -497,6 +560,12 @@ def compute_city_snapshot(city_name: str, fast: bool = False):
     # 3) Final fallback (should be rare): use Value%.
     if best is None:
         cand = df.dropna(subset=["Value %"]).copy()
+        # Exclude "not worth betting" heavy favorites (odds <= -300)
+        if "Odds" in cand.columns:
+            cand = cand[~cand["Odds"].apply(is_odds_too_expensive)].copy()
+        # If market is locked, skip the dominant (already-decided) contract
+        if locked_dom is not None:
+            cand = cand[cand["Contract"].astype(str) != locked_dom].copy()
         if len(cand):
             best = cand.sort_values("Value %", ascending=False).iloc[0].to_dict()
             best["Acc score %"] = None
@@ -703,6 +772,7 @@ styled_lb = (
 )
 
 st.subheader("Best bet by city (ranked)")
+st.caption(f"Odds guardrails: exclude favorites <= {ODDS_EXCLUDE_FAVORITE_AT_OR_BELOW} · warn longshots >= +{ODDS_WARN_LONGSHOT_AT_OR_ABOVE}")
 st.dataframe(styled_lb, width="stretch", hide_index=True)
 
 # -----------------------
@@ -730,6 +800,7 @@ else:
 
     table = df_city[["Contract", "YES ask %", "Odds", "Volume", "Value %", "Model %"]].copy()
     table["Volume"] = pd.to_numeric(table["Volume"], errors="coerce")
+    table["⚠️"] = table["Odds"].apply(lambda s: "⚠️" if is_odds_longshot(s) else "")
 
     styled = (
         table.style
