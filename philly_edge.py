@@ -45,9 +45,24 @@ PATH_MARKETS = "/trade-api/v2/markets"
 PATH_MARKET = "/trade-api/v2/markets/{ticker}"
 PATH_EVENT = "/trade-api/v2/events/{event_ticker}"
 
+
 STATION = "KPHL"
 LAT = 39.872
 LON = -75.241
+
+# Station-local timezone for IEM/ASOS queries (prevents day-boundary mismatches)
+STATION_TZ = {
+    "KPHL": "America/New_York",
+    "KMIA": "America/New_York",
+    "KNYC": "America/New_York",
+    "KLAX": "America/Los_Angeles",
+    "KDEN": "America/Denver",
+    "KMDW": "America/Chicago",
+    "KAUS": "America/Chicago",
+}
+
+def _station_tz_name() -> str:
+    return STATION_TZ.get(STATION, "UTC")
 
 # Philly in January (EST = UTC-5)
 TZ = timezone(timedelta(hours=-5))
@@ -738,36 +753,171 @@ def log_forecast_snapshot():
     with FORECAST_LOG.open("a", encoding="utf-8") as f:
         f.write(json.dumps(rec) + "\n")
 
-def _fetch_observed_daily_high(date_s: str) -> Optional[float]:
+
+# Helper: Fetch observed daily high (°F) for a station/date using api.weather.gov (NWS)
+def _fetch_observed_daily_high_nws(date_s: str, station_icao: str, tz_name: str) -> Optional[float]:
+    """Fetch observed daily high (°F) for a station/date using api.weather.gov.
+
+    This is typically the most reliable source for the last ~7 days and avoids
+    IEM timezone/day-boundary quirks.
     """
-    Fetch observed high (°F) for STATION on date_s using IEM ASOS JSON.
-    We compute max(tmpf) for that UTC date window; good enough for daily high.
-    """
-    # IEM ASOS request. We already use requests in this file.
-    y, m, d = date_s.split("-")
-    params = {
-        "station": STATION,
-        "data": "tmpf",
-        "year1": int(y), "month1": int(m), "day1": int(d),
-        "year2": int(y), "month2": int(m), "day2": int(d),
-        "tz": "America/New_York",
-        "format": "json",
-    }
-    url = "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py"
-    r = requests.get(url, params=params, timeout=30)
-    r.raise_for_status()
-    j = r.json()
-    temps = []
-    for row in j.get("data", []):
-        t = row.get("tmpf")
+    try:
+        from zoneinfo import ZoneInfo
+    except Exception:
+        ZoneInfo = None
+
+    # Build local-day window
+    try:
+        tz = ZoneInfo(tz_name) if ZoneInfo else timezone.utc
+    except Exception:
+        tz = timezone.utc
+
+    day0_local = datetime.strptime(date_s, "%Y-%m-%d").replace(tzinfo=tz)
+    day1_local = day0_local + timedelta(days=1)
+
+    start_utc = day0_local.astimezone(timezone.utc)
+    end_utc = day1_local.astimezone(timezone.utc)
+
+    start_iso = start_utc.isoformat().replace("+00:00", "Z")
+
+    # Query observations since start; we will filter to [start,end)
+    data = nws_get_json(f"https://api.weather.gov/stations/{station_icao}/observations?start={start_iso}")
+
+    high_f = None
+    for feat in data.get("features", []):
+        p = feat.get("properties", {})
+        ts = p.get("timestamp")
+        tc = (p.get("temperature") or {}).get("value")
+        if not ts or tc is None:
+            continue
         try:
-            if t is not None:
-                temps.append(float(t))
+            t_utc = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(timezone.utc)
+        except Exception:
+            continue
+        if t_utc < start_utc or t_utc >= end_utc:
+            continue
+        try:
+            tf = _c_to_f(float(tc))
+        except Exception:
+            continue
+        high_f = tf if high_f is None else max(high_f, tf)
+
+    return None if high_f is None else float(high_f)
+
+def _fetch_observed_daily_high(date_s: str, station_icao: Optional[str] = None, city: Optional[str] = None) -> Optional[float]:
+    """Fetch observed daily high (°F) for a station on date_s.
+
+    Strategy:
+    1) Try api.weather.gov station observations first (fast + reliable for recent days)
+    2) Fall back to IEM ASOS JSON (broader station coverage)
+
+    Returns None if no data is available.
+    """
+    # Determine timezone context for this city/station (prevents day-boundary mismatches)
+    def _tz_for_station_or_city(station_code: str) -> str:
+        c = (station_code or "").strip().upper()
+        if c in STATION_TZ:
+            return STATION_TZ[c]
+        if c.startswith("K") and len(c) == 4 and c[1:] and ("K" + c[1:]) in STATION_TZ:
+            return STATION_TZ["K" + c[1:]]
+        if len(c) == 3 and ("K" + c) in STATION_TZ:
+            return STATION_TZ["K" + c]
+        CITY_TZ_FALLBACK = {
+            "NYC": "America/New_York",
+            "New York": "America/New_York",
+            "Philadelphia": "America/New_York",
+            "Miami": "America/New_York",
+            "Los Angeles": "America/Los_Angeles",
+            "Denver": "America/Denver",
+            "Chicago": "America/Chicago",
+            "Austin": "America/Chicago",
+        }
+        if city:
+            return CITY_TZ_FALLBACK.get(city, "UTC")
+        return "UTC"
+
+    stn = (station_icao or STATION or "").strip().upper()
+
+    # Build candidate station codes (ICAO + 3-letter) + city fallbacks
+    CITY_STATION_FALLBACK = {
+        "NYC": ["LGA", "JFK", "EWR"],
+        "New York": ["LGA", "JFK", "EWR"],
+        "Philadelphia": ["PHL", "KPNE"],
+        "Los Angeles": ["LAX", "BUR", "LGB"],
+        "Denver": ["DEN", "BJC"],
+        "Miami": ["MIA", "FLL"],
+        "Chicago": ["MDW", "ORD"],
+        "Austin": ["AUS"],
+    }
+
+    station_candidates = []
+    if stn:
+        station_candidates.append(stn)
+        if stn.startswith("K") and len(stn) == 4:
+            station_candidates.append(stn[1:])
+
+    if city:
+        station_candidates.extend(CITY_STATION_FALLBACK.get(city, []))
+
+    # De-dupe while preserving order
+    seen = set()
+    station_candidates = [s for s in station_candidates if s and not (s in seen or seen.add(s))]
+
+    # 1) Try NWS first (needs ICAO like KLAX)
+    for cand in station_candidates:
+        icao = cand
+        if len(icao) == 3:
+            icao = "K" + icao
+        tz_name = _tz_for_station_or_city(icao)
+        try:
+            out = _fetch_observed_daily_high_nws(date_s, station_icao=icao, tz_name=tz_name)
+            if out is not None:
+                return out
         except Exception:
             pass
-    if not temps:
-        return None
-    return float(max(temps))
+
+    # 2) Fall back to IEM ASOS JSON
+    day0 = datetime.strptime(date_s, "%Y-%m-%d")
+    day1 = day0 + timedelta(days=1)
+    y, m, d = day0.strftime("%Y"), day0.strftime("%m"), day0.strftime("%d")
+    y2, m2, d2 = day1.strftime("%Y"), day1.strftime("%m"), day1.strftime("%d")
+
+    url = "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py"
+
+    def _try_station(station_code: str) -> Optional[float]:
+        tz_name = _tz_for_station_or_city(station_code)
+        params = {
+            "station": station_code,
+            "data": "tmpf",
+            "year1": int(y), "month1": int(m), "day1": int(d),
+            "year2": int(y2), "month2": int(m2), "day2": int(d2),
+            "tz": tz_name,
+            "format": "json",
+        }
+        r = _HTTP.get(url, params=params, timeout=30)
+        r.raise_for_status()
+        j = r.json()
+        temps = []
+        for row in j.get("data", []):
+            t = row.get("tmpf")
+            try:
+                if t is not None and str(t).strip() != "":
+                    temps.append(float(t))
+            except Exception:
+                pass
+        if not temps:
+            return None
+        return float(max(temps))
+
+    for cand in station_candidates:
+        try:
+            out = _try_station(cand)
+            if out is not None:
+                return out
+        except Exception:
+            continue
+
+    return None
 
 def _robust_std(vals) -> Optional[float]:
     """Robust sigma estimate using MAD -> std (scaled)."""
@@ -890,14 +1040,23 @@ def _parse_bucket_label(label: str):
 
 def _label_matches_temp(label: str, temp_f: float) -> bool:
     lo, hi = _parse_bucket_label(label)
-    t = float(temp_f)
+
+    # Kalshi settles on an integer daily high (°F). Our observed highs often come
+    # from Celsius -> Fahrenheit conversion and include decimals (e.g., 64.4).
+    # To match contract buckets like “63° to 64°”, we compare using the rounded
+    # integer high.
+    try:
+        t_int = int(round(float(temp_f)))
+    except Exception:
+        return False
+
     if lo is None and hi is None:
         return False
     if lo is None:
-        return t <= hi
+        return t_int <= hi
     if hi is None:
-        return t >= lo
-    return (lo <= t <= hi)
+        return t_int >= lo
+    return (lo <= t_int <= hi)
 
 def _resolve_winning_label(labels: list, observed_high_f: float) -> Optional[str]:
     for lab in labels:
@@ -1209,37 +1368,43 @@ def perf_update_outcomes():
         if not date_s:
             continue
 
+        # Skip today (don’t finalize outcomes mid-day)
+        if date_s == today:
+            continue
+
         if (row.get("observed_high_f") or "").strip():
             continue
 
+        city = (row.get("city") or "").strip()
         station = (row.get("station") or "").strip() or STATION
+        # Ensure ICAO style for lookups (e.g., LAX -> KLAX)
+        if station and len(station) == 3:
+            station = "K" + station
 
-        # labels_json: try normal JSON, then legacy repair
+        # labels_json: normalize then parse
         labels = []
         raw = row.get("labels_json")
         if raw:
+            # Normalize legacy escaped formats into a clean JSON array string
+            norm = _normalize_labels_json(raw)
+            if norm is None:
+                norm = str(raw).strip()
             try:
-                obj = json.loads(raw)
+                obj = json.loads(norm)
                 if isinstance(obj, list):
                     labels = obj
                 elif isinstance(obj, str):
                     labels = json.loads(obj)
+                # Persist normalized form if it changed
+                if norm and norm != str(raw).strip():
+                    row["labels_json"] = norm
+                    changed = True
             except Exception:
-                fixed = _repair_legacy_labels_json(raw)
-                if fixed:
-                    try:
-                        labels = json.loads(fixed)
-                        row["labels_json"] = fixed
-                        changed = True
-                    except Exception:
-                        labels = []
+                labels = []
 
-        # Fetch observed high
+        # Fetch observed high using the correct city/station context
         try:
-            old_station = globals().get("STATION", station)
-            globals()["STATION"] = station
-            obs_high = _fetch_observed_daily_high(date_s)
-            globals()["STATION"] = old_station
+            obs_high = _fetch_observed_daily_high(date_s, station_icao=station, city=city)
         except Exception:
             obs_high = None
 
@@ -1359,7 +1524,7 @@ def obs_latest_and_high_today():
         "data": "tmpf",
         "year1": int(y), "month1": int(m), "day1": int(d),
         "year2": int(y), "month2": int(m), "day2": int(d),
-        "tz": "America/New_York",
+        "tz": _station_tz_name(),
         "format": "json",
     }
     url = "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py"
