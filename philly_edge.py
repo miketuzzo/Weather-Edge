@@ -1072,7 +1072,7 @@ def _ensure_perf_header():
         return
     PERF_CSV.write_text(
         "date,city,station,sigma_f,labels_json,best_contract,yes_ask_prob,model_prob,value_prob,"
-        "observed_high_f,winning_contract,won,profit,strategy\n",
+        "observed_high_f,winning_contract,won,profit,computed_winning,computed_won,strategy\n",
         encoding="utf-8"
     )
 
@@ -1110,10 +1110,21 @@ def perf_log_snapshot(
     columns = [
         "date","city","station","sigma_f","labels_json","best_contract",
         "yes_ask_prob","model_prob","value_prob",
-        "observed_high_f","winning_contract","won","profit","strategy",
+        "observed_high_f","winning_contract","won","profit",
+        "computed_winning","computed_won",
+        "strategy",
     ]
 
-    labels_json = json.dumps(labels, ensure_ascii=False)
+    # Store labels AND their parsed bounds at lock time (audit-safe)
+    bounds = []
+    for lab in (labels or []):
+        try:
+            lo, hi = _parse_bucket_label(str(lab))
+            bounds.append({"label": str(lab), "lo": lo, "hi": hi})
+        except Exception:
+            bounds.append({"label": str(lab), "lo": None, "hi": None})
+
+    labels_json = json.dumps({"labels": labels or [], "bounds": bounds}, ensure_ascii=False)
 
     out_row = {
         "date": date_s,
@@ -1129,6 +1140,8 @@ def perf_log_snapshot(
         "winning_contract": "",
         "won": "",
         "profit": "",
+        "computed_winning": "",
+        "computed_won": "",
         "strategy": strategy,
     }
 
@@ -1184,11 +1197,21 @@ def _normalize_labels_json(raw: str) -> Optional[str]:
         return vv
 
     def _to_list(obj) -> Optional[list]:
+        # New format: {"labels": [...], "bounds": [...]}
+        if isinstance(obj, dict):
+            lab = obj.get("labels")
+            if isinstance(lab, list):
+                return lab
+            return None
         if isinstance(obj, list):
             return obj
         if isinstance(obj, str):
             try:
                 obj2 = json.loads(obj)
+                if isinstance(obj2, dict):
+                    lab = obj2.get("labels")
+                    if isinstance(lab, list):
+                        return lab
                 if isinstance(obj2, list):
                     return obj2
             except Exception:
@@ -1242,7 +1265,9 @@ def perf_repair_csv_in_place() -> int:
     fieldnames = [
         "date","city","station","sigma_f","labels_json","best_contract",
         "yes_ask_prob","model_prob","value_prob",
-        "observed_high_f","winning_contract","won","profit","strategy",
+        "observed_high_f","winning_contract","won","profit",
+        "computed_winning","computed_won",
+        "strategy",
     ]
 
     with PERF_CSV.open("r", newline="", encoding="utf-8") as f:
@@ -1356,7 +1381,7 @@ def perf_update_outcomes():
         rows = list(reader)
 
     # Ensure required columns exist
-    required = ["observed_high_f", "winning_contract", "won", "profit", "strategy"]
+    required = ["observed_high_f", "winning_contract", "won", "profit", "strategy", "computed_winning", "computed_won"]
     for c in required:
         if c not in fieldnames:
             fieldnames.append(c)
@@ -1383,24 +1408,60 @@ def perf_update_outcomes():
 
         # labels_json: normalize then parse
         labels = []
+        bounds = []
         raw = row.get("labels_json")
         if raw:
-            # Normalize legacy escaped formats into a clean JSON array string
+            # Normalize legacy escaped formats into a clean JSON array string (labels only)
             norm = _normalize_labels_json(raw)
             if norm is None:
                 norm = str(raw).strip()
             try:
                 obj = json.loads(norm)
-                if isinstance(obj, list):
+
+                # New audit-safe format: {"labels": [...], "bounds": [...]}
+                if isinstance(obj, dict):
+                    lab = obj.get("labels")
+                    bnd = obj.get("bounds")
+                    if isinstance(lab, list):
+                        labels = lab
+                    if isinstance(bnd, list):
+                        bounds = bnd
+
+                # Old format: list[str]
+                elif isinstance(obj, list):
                     labels = obj
+
+                # Rare legacy: JSON string that itself contains JSON
                 elif isinstance(obj, str):
-                    labels = json.loads(obj)
-                # Persist normalized form if it changed
+                    obj2 = json.loads(obj)
+                    if isinstance(obj2, dict):
+                        lab = obj2.get("labels")
+                        bnd = obj2.get("bounds")
+                        if isinstance(lab, list):
+                            labels = lab
+                        if isinstance(bnd, list):
+                            bounds = bnd
+                    elif isinstance(obj2, list):
+                        labels = obj2
+
+                # Persist normalized form if it changed (labels-only normalization)
                 if norm and norm != str(raw).strip():
                     row["labels_json"] = norm
                     changed = True
+
             except Exception:
                 labels = []
+                bounds = []
+
+        # If bounds not present, derive them from labels (best-effort)
+        if (not bounds) and labels:
+            bounds = []
+            for lab in labels:
+                try:
+                    lo, hi = _parse_bucket_label(str(lab))
+                    bounds.append({"label": str(lab), "lo": lo, "hi": hi})
+                except Exception:
+                    bounds.append({"label": str(lab), "lo": None, "hi": None})
 
         # Fetch observed high using the correct city/station context
         try:
@@ -1426,7 +1487,38 @@ def perf_update_outcomes():
         if obs_high is None:
             continue
 
-        winning = _resolve_winning_label(labels, obs_high) or ""
+        # Audit-safe winning label: use integer-rounded high + stored bounds when available
+        def _winning_from_bounds(bnds, high_f):
+            try:
+                t_int = int(round(float(high_f)))
+            except Exception:
+                return ""
+            for b in (bnds or []):
+                try:
+                    lab = (b.get("label") or "").strip()
+                    lo = b.get("lo", None)
+                    hi = b.get("hi", None)
+                    if not lab:
+                        continue
+                    if lo is None and hi is None:
+                        continue
+                    if lo is None:
+                        if t_int <= int(hi):
+                            return lab
+                    elif hi is None:
+                        if t_int >= int(lo):
+                            return lab
+                    else:
+                        if int(lo) <= t_int <= int(hi):
+                            return lab
+                except Exception:
+                    continue
+            return ""
+
+        winning = _winning_from_bounds(bounds, obs_high) or (_resolve_winning_label(labels, obs_high) or "")
+
+        # Persist independent audit columns (computed from obs_high + stored bounds)
+        row["computed_winning"] = winning
 
         best_contract = (row.get("best_contract") or "").strip()
         yes_ask_prob = (row.get("yes_ask_prob") or "").strip()
@@ -1436,6 +1528,9 @@ def perf_update_outcomes():
             price = None
 
         won = "1" if (winning and best_contract == winning) else "0"
+
+        # Persist computed_won audit column
+        row["computed_won"] = won
 
         profit = ""
         if price is not None:
@@ -1475,6 +1570,9 @@ def perf_load_df():
     # Back-compat: ensure strategy exists
     if "strategy" not in df.columns:
         df["strategy"] = ""
+    for c in ["computed_winning", "computed_won"]:
+        if c not in df.columns:
+            df[c] = ""
     return df
 
 # -----------------------
