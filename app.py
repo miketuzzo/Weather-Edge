@@ -343,9 +343,35 @@ deployed_txt = (
     if DEPLOYED_AT_ET is not None
     else "unknown"
 )
+
 st.caption(
     f"Deploy check — commit `{DEPLOY_SHA}` · deployed {deployed_txt} · page loaded {APP_LOADED_ET.strftime('%Y-%m-%d %I:%M %p %Z')}"
 )
+
+# --- Live-vs-local sanity checks (helps debug "why is live different?") ---
+perf_path = os.path.join("data", "performance.csv")
+perf_exists = os.path.exists(perf_path)
+perf_rows = None
+perf_mtime = None
+perf_note = ""
+try:
+    if perf_exists:
+        perf_mtime = datetime.fromtimestamp(os.path.getmtime(perf_path), tz=timezone.utc).astimezone(ET_TZ)
+        _tmp = pd.read_csv(perf_path)
+        perf_rows = int(len(_tmp))
+        # quick peek at last recorded date/strategy
+        _last_date = _tmp["date"].dropna().astype(str).iloc[-1] if ("date" in _tmp.columns and len(_tmp)) else ""
+        _last_strat = _tmp["strategy"].dropna().astype(str).iloc[-1] if ("strategy" in _tmp.columns and len(_tmp)) else ""
+        if _last_date or _last_strat:
+            perf_note = f" · last: {_last_date} {_last_strat}".strip()
+except Exception as _e:
+    perf_note = f" · perf read error: {_e}" 
+
+# Show a compact debug line so you can confirm the live server has your same data file
+perf_mtime_txt = perf_mtime.strftime('%Y-%m-%d %I:%M %p %Z') if perf_mtime is not None else "—"
+perf_rows_txt = str(perf_rows) if perf_rows is not None else ("0" if perf_exists else "missing")
+st.caption(f"Data check — performance.csv: {perf_rows_txt} rows · mtime {perf_mtime_txt}{perf_note}")
+
 best_bet_slot = st.container()
 
 load_status = st.empty()
