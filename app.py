@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 import time
 from zoneinfo import ZoneInfo
 import os
+import json
+import re
 from typing import Optional
 
 # --- Deploy check (confirms Streamlit redeployed your latest push) ---
@@ -329,8 +331,13 @@ def render_overall_best_bet(snapshot_tables: dict):
                 best = {"city": city, "row": top_city}
 
     if best is None:
-        st.markdown("</div>", unsafe_allow_html=True)
-        st.info("No viable overall best bet right now (missing market/model data or markets are locked).")
+        st.markdown(
+            """
+            <div style=\"margin-top:8px;opacity:0.85;\">No viable overall bet right now — either market/model data is missing, the best prices are filtered (odds guardrails), or markets are effectively locked.</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
         return
 
     city = best["city"]
@@ -640,7 +647,9 @@ for city_name in CITIES.keys():
             station = CITIES[city_name]["station_obs"]
 
             yes_ask_prob = (float(top_city["YES ask %"]) / 100.0) if pd.notna(top_city["YES ask %"]) else None
-            model_prob = (float(top_city["Model %"]) / 100.0) if pd.notna(top_city["Model %"]) else None
+            # per-city tables now use Forecast win %
+            _m = top_city.get("Forecast win %", None)
+            model_prob = (float(_m) / 100.0) if (_m is not None and pd.notna(_m)) else None
             value_prob = (float(top_city["Value %"]) / 100.0) if pd.notna(top_city["Value %"]) else None
             volume = top_city.get("Volume", None)
 
@@ -672,7 +681,7 @@ for city_name in CITIES.keys():
                 labels=labels,
                 best_contract=best.get("Contract"),
                 yes_ask_prob=(best.get("YES ask %")/100.0 if best.get("YES ask %") is not None else None),
-                model_prob=(best.get("Model %")/100.0 if best.get("Model %") is not None else None),
+                model_prob=(best.get("Forecast win %")/100.0 if best.get("Forecast win %") is not None else None),
                 value_prob=(best.get("Value %")/100.0 if best.get("Value %") is not None else None),
                 strategy="lock_0930",
             )
@@ -689,7 +698,7 @@ for city_name in CITIES.keys():
                 labels=labels,
                 best_contract=best.get("Contract"),
                 yes_ask_prob=(best.get("YES ask %")/100.0 if best.get("YES ask %") is not None else None),
-                model_prob=(best.get("Model %")/100.0 if best.get("Model %") is not None else None),
+                model_prob=(best.get("Forecast win %")/100.0 if best.get("Forecast win %") is not None else None),
                 value_prob=(best.get("Value %")/100.0 if best.get("Value %") is not None else None),
                 strategy="lock_1200",
             )
@@ -943,7 +952,8 @@ if hasattr(pe, "perf_load_df"):
     except Exception as e:
         st.error(f"Failed to load performance history: {e}")
         perf = pd.DataFrame()
-    done = perf.dropna(subset=["observed_high_f", "profit", "won"]).copy()
+    # Use only rows that have observed highs + profit; we will recompute wins independently
+    done = perf.dropna(subset=["observed_high_f", "profit"]).copy()
 
     if done.empty:
         st.info(
@@ -956,17 +966,102 @@ if hasattr(pe, "perf_load_df"):
     else:
         # Normalize types
         done["profit"] = pd.to_numeric(done["profit"], errors="coerce")
-        done["won"] = pd.to_numeric(done["won"], errors="coerce")
-        done = done.dropna(subset=["profit", "won"]).copy()
-
+        if "won" in done.columns:
+            done["won"] = pd.to_numeric(done["won"], errors="coerce")
         # Ensure strategy exists
         if "strategy" not in done.columns:
             done["strategy"] = "lock_0930"
         done["strategy"] = done["strategy"].fillna("lock_0930")
-
         # Keep only the lock strategies we care about
         keep_strats = ["lock_0930", "lock_1200"]
         done = done[done["strategy"].isin(keep_strats)].copy()
+
+        # --- Long-term accuracy: recompute winners + W/L from observed high and saved bucket labels ---
+        def _parse_bucket_label(lbl: str):
+            """Return (lo, hi, kind) where kind is one of: 'range', 'below', 'above'."""
+            if not isinstance(lbl, str):
+                return None
+            s = lbl.strip()
+            s = s.replace("º", "°")
+            s = re.sub(r"\s+", " ", s)
+
+            m = re.match(r"^(\-?\d+)\s*°\s*to\s*(\-?\d+)\s*°$", s)
+            if m:
+                lo = float(m.group(1))
+                hi = float(m.group(2))
+                return (lo, hi, "range")
+
+            m = re.match(r"^(\-?\d+)\s*°\s*or\s*below$", s)
+            if m:
+                hi = float(m.group(1))
+                return (None, hi, "below")
+
+            m = re.match(r"^(\-?\d+)\s*°\s*or\s*above$", s)
+            if m:
+                lo = float(m.group(1))
+                return (lo, None, "above")
+
+            return None
+
+        def _winner_from_observed(obs_f: float, labels_json: str) -> Optional[str]:
+            """Compute which bucket label contains the observed high (independent check)."""
+            if obs_f is None or (isinstance(obs_f, float) and pd.isna(obs_f)):
+                return None
+            try:
+                labels = json.loads(labels_json) if isinstance(labels_json, str) else None
+            except Exception:
+                labels = None
+            if not isinstance(labels, list) or not labels:
+                return None
+
+            x = float(obs_f)
+            for lbl in labels:
+                spec = _parse_bucket_label(str(lbl))
+                if spec is None:
+                    continue
+                lo, hi, kind = spec
+                if kind == "range":
+                    if (x >= lo) and (x <= hi):
+                        return str(lbl)
+                elif kind == "below":
+                    if x <= hi:
+                        return str(lbl)
+                elif kind == "above":
+                    if x >= lo:
+                        return str(lbl)
+            return None
+
+        # If we have labels_json + best_contract, recompute winning bucket and win/loss.
+        if "labels_json" in done.columns:
+            done["computed_winning_contract"] = [
+                _winner_from_observed(o, lj)
+                for o, lj in zip(done.get("observed_high_f"), done.get("labels_json"))
+            ]
+        else:
+            done["computed_winning_contract"] = None
+
+        # Prefer computed winner; fall back to stored winning_contract if computed missing
+        if "winning_contract" in done.columns:
+            done["winning_contract_true"] = done["computed_winning_contract"].where(
+                done["computed_winning_contract"].notna(),
+                done["winning_contract"],
+            )
+        else:
+            done["winning_contract_true"] = done["computed_winning_contract"]
+
+        # Recompute win flag from best_contract vs winner
+        if "best_contract" in done.columns:
+            done["won_true"] = (
+                done["best_contract"].astype(str) == done["winning_contract_true"].astype(str)
+            ).astype(float)
+        else:
+            # If missing best_contract, fall back to stored won
+            done["won_true"] = pd.to_numeric(done.get("won"), errors="coerce")
+
+        # Track whether the stored win flag disagrees with recomputed
+        done["won_mismatch"] = (
+            pd.to_numeric(done.get("won"), errors="coerce") != pd.to_numeric(done["won_true"], errors="coerce")
+        )
 
         # Limit history for speed (last N dates with settled outcomes)
         MAX_HISTORY_DAYS = 30
@@ -976,32 +1071,39 @@ if hasattr(pe, "perf_load_df"):
         except Exception:
             pass
 
-        st.markdown("### Daily summary by lock time (W–L only)")
+        # -------------------------
+        # Simplified daily view
+        # -------------------------
+        st.markdown("### Daily results (7 cities) — 09:30 CST and 12:00 CST")
+        st.caption(
+            "Each day shows how many of the 7 city picks won at each lock time. "
+            "Use the dropdown to see the exact pick vs. actual winning bucket (green = win, red = loss)."
+        )
 
+        # Daily W/L table (one row per date)
         daily = (
             done.groupby(["date", "strategy"], as_index=False)
                 .agg(
-                    bets=("won", "count"),
-                    wins=("won", "sum"),
+                    bets=("won_true", "count"),
+                    wins=("won_true", "sum"),
                 )
         )
-
-        def _pivot_cell(df_in: pd.DataFrame, strat: str, col: str):
-            return df_in[df_in["strategy"] == strat].set_index("date")[col]
 
         dates = pd.Index(sorted(daily["date"].unique(), reverse=True), name="date")
         out = pd.DataFrame({"date": dates})
 
-        for strat, label in [("lock_0930", "09:30 CST"), ("lock_1200", "12:00 CST")]:
-            bets_s = _pivot_cell(daily, strat, "bets").reindex(dates)
-            wins_s = _pivot_cell(daily, strat, "wins").reindex(dates)
+        def _wl_for(date_s: str, strat: str) -> str:
+            sub = daily[(daily["date"] == date_s) & (daily["strategy"] == strat)]
+            if sub.empty:
+                return "—"
+            b = float(sub.iloc[0]["bets"])
+            w = float(sub.iloc[0]["wins"])
+            if pd.isna(b) or b <= 0:
+                return "—"
+            return f"{int(w)}/{int(b)}"
 
-            out[f"{label} W-L"] = [
-                "—" if pd.isna(b) else f"{int(w)}/{int(b)}"
-                for w, b in zip(wins_s, bets_s)
-            ]
-
-        wl_cols = [c for c in out.columns if c.endswith("W-L")]
+        out["09:30 CST W–L"] = [ _wl_for(d, "lock_0930") for d in dates ]
+        out["12:00 CST W–L"] = [ _wl_for(d, "lock_1200") for d in dates ]
 
         def _bg_wl(s: str):
             if not isinstance(s, str) or s == "—":
@@ -1009,21 +1111,68 @@ if hasattr(pe, "perf_load_df"):
             try:
                 w, b = s.split("/")
                 w = int(w); b = int(b)
-                if b == 0:
+                if b <= 0:
                     return ""
                 if w == b:
-                    return "background-color: rgba(34,197,94,0.18);"
+                    return "background-color: rgba(34,197,94,0.18);"  # all green
                 if w == 0:
-                    return "background-color: rgba(239,68,68,0.18);"
-                return "background-color: rgba(250,204,21,0.14);"  # yellow-ish for mixed
+                    return "background-color: rgba(239,68,68,0.18);"  # all red
+                return "background-color: rgba(250,204,21,0.14);"      # mixed yellow
             except Exception:
                 return ""
 
-        styled_out = out.style.applymap(_bg_wl, subset=wl_cols)
-        st.dataframe(styled_out, width="stretch", hide_index=True)
+        wl_cols = [c for c in out.columns if c.endswith("W–L")]
+        st.dataframe(out.style.applymap(_bg_wl, subset=wl_cols), width="stretch", hide_index=True)
 
-        # ------------------------------------------------------------------
-        # Combined: Performance by city + inline settled rows
+        # Drilldown: show the 7 city picks for a chosen date/lock
+        st.markdown("### What did it pick?")
+        settled_dates = sorted(done["date"].dropna().astype(str).unique().tolist(), reverse=True)
+        if settled_dates:
+            drill_date = st.selectbox("Date", options=settled_dates, index=0, key="drill_date")
+            drill_lock = st.selectbox("Lock time", options=["09:30 CST", "12:00 CST"], index=0, key="drill_lock")
+            drill_strat = "lock_0930" if drill_lock.startswith("09") else "lock_1200"
+
+            ddf = done[(done["date"].astype(str) == str(drill_date)) & (done["strategy"] == drill_strat)].copy()
+
+            # Ensure we have a winning contract column to display
+            if "winning_contract_true" not in ddf.columns:
+                ddf["winning_contract_true"] = ddf.get("winning_contract")
+
+            # Display columns: City, Pick, Actual winner, Observed high
+            show = ddf[[c for c in ["city", "best_contract", "winning_contract_true", "observed_high_f", "won_true"] if c in ddf.columns]].copy()
+            show = show.rename(columns={
+                "city": "City",
+                "best_contract": "Pick",
+                "winning_contract_true": "Winning contract",
+                "observed_high_f": "Observed high (°F)",
+                "won_true": "Won",
+            })
+
+            # Style: green row if won, red if lost
+            def _bg_row_won(row):
+                v = row.get("Won")
+                try:
+                    if pd.isna(v):
+                        return [""] * len(row)
+                    return ["background-color: rgba(34,197,94,0.14);" if float(v) >= 1.0 else "background-color: rgba(239,68,68,0.14);"] * len(row)
+                except Exception:
+                    return [""] * len(row)
+
+            # Also color the observed high cell a bit stronger
+            def _bg_obs(v):
+                try:
+                    return ""
+                except Exception:
+                    return ""
+
+            styled_show = (
+                show.style
+                    .format({"Observed high (°F)": "{:.1f}"}, na_rep="—")
+                    .apply(_bg_row_won, axis=1)
+            )
+            st.dataframe(styled_show, width="stretch", hide_index=True)
+        else:
+            st.info("No settled dates yet.")
         # ------------------------------------------------------------------
         st.subheader("Performance by city")
         st.caption("Click a city to see its settled rows. Win% = % of locked picks that matched the winning contract.")
@@ -1035,9 +1184,9 @@ if hasattr(pe, "perf_load_df"):
             g = (
                 df_in.groupby("city", as_index=False)
                     .agg(
-                        bets=("won", "count"),
-                        wins=("won", "sum"),
-                        win_rate=("won", "mean"),
+                        bets=("won_true", "count"),
+                        wins=("won_true", "sum"),
+                        win_rate=("won_true", "mean"),
                     )
             )
             g["Win%"] = (pd.to_numeric(g["win_rate"], errors="coerce") * 100.0).round(1)
@@ -1065,24 +1214,27 @@ if hasattr(pe, "perf_load_df"):
                 return d
             d = d.sort_values(["date", "strategy"], ascending=[False, True])
 
-            # friendly percent columns
-            if "yes_ask_prob" in d.columns:
-                d["YES ask %"] = (pd.to_numeric(d["yes_ask_prob"], errors="coerce") * 100).round(1)
-            if "model_prob" in d.columns:
-                d["Forecast win %"] = (pd.to_numeric(d["model_prob"], errors="coerce") * 100).round(1)
-            if "value_prob" in d.columns:
-                d["Value %"] = (pd.to_numeric(d["value_prob"], errors="coerce") * 100).round(1)
-            if "profit" in d.columns:
-                d["Profit %"] = (pd.to_numeric(d["profit"], errors="coerce") * 100).round(2)
+            # Only show the minimal settled-row fields for legibility
+            if "winning_contract_true" not in d.columns:
+                d["winning_contract_true"] = d.get("winning_contract")
 
             cols = [
                 c for c in [
-                    "date", "strategy", "best_contract", "winning_contract",
-                    "observed_high_f", "YES ask %", "Forecast win %", "Value %", "won", "Profit %"
+                    "date",
+                    "strategy",
+                    "best_contract",
+                    "winning_contract_true",
+                    "observed_high_f",
+                    "won_true",
                 ]
                 if c in d.columns
             ]
-            return d[cols]
+            out = d[cols].copy()
+            out = out.rename(columns={
+                "winning_contract_true": "winning_contract",
+                "observed_high_f": "observed_high_f",
+            })
+            return out
 
         def _render_city_panel(df_in: pd.DataFrame, label: str):
             if df_in.empty:
@@ -1110,14 +1262,29 @@ if hasattr(pe, "perf_load_df"):
                 st.caption("No settled rows for this city yet in this view.")
                 return
 
-            # Add quick W/L indicators per row
-            if "won" in rows.columns:
-                def _bg_won(v):
-                    if v is None or (isinstance(v, float) and pd.isna(v)):
-                        return ""
-                    return "background-color: rgba(34,197,94,0.18);" if float(v) >= 1.0 else "background-color: rgba(239,68,68,0.18);"
+            # Color the observed high cell green/red depending on win/loss
+            if "won_true" in rows.columns:
+                rows2 = rows.copy()
 
-                st.dataframe(rows.style.applymap(_bg_won, subset=["won"]), width="stretch", hide_index=True)
+                def _bg_obs_cell(_v, _won):
+                    if _won is None or (isinstance(_won, float) and pd.isna(_won)):
+                        return ""
+                    return "background-color: rgba(34,197,94,0.22);" if float(_won) >= 1.0 else "background-color: rgba(239,68,68,0.22);"
+
+                def _style_obs(s):
+                    # s is a Series for the observed_high_f column
+                    return [
+                        _bg_obs_cell(v, w)
+                        for v, w in zip(rows2.get("observed_high_f"), rows2.get("won_true"))
+                    ]
+
+                # Hide won_true from the table, but keep it for styling
+                display_cols = [c for c in rows2.columns if c != "won_true"]
+                st.dataframe(
+                    rows2[display_cols].style.format({"observed_high_f": "{:.1f}"}, na_rep="—").apply(_style_obs, subset=["observed_high_f"]),
+                    width="stretch",
+                    hide_index=True,
+                )
             else:
                 st.dataframe(rows, width="stretch", hide_index=True)
 
