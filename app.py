@@ -244,7 +244,7 @@ def render_overall_best_bet(snapshot_tables: dict):
     st.markdown(
         """
         <div style="padding:14px 16px;border-radius:14px;border:1px solid rgba(255,255,255,0.10);background:rgba(255,255,255,0.03);">
-          <div style="font-size:14px;opacity:0.75;margin-bottom:6px;">Overall best bet (accuracy-first, market-blended)</div>
+          <div style="font-size:14px;opacity:0.75;margin-bottom:6px;">Overall best bet (accuracy-first)</div>
         """,
         unsafe_allow_html=True,
     )
@@ -360,13 +360,13 @@ def render_overall_best_bet(snapshot_tables: dict):
         <div style="height:100%;display:flex;flex-direction:column;justify-content:center;align-items:flex-end;">
           <div style="font-size:12px;opacity:0.7;">Edge (Value %)</div>
           <div style="font-size:26px;font-weight:700;color:{edge_color};line-height:1;">{edge_txt}</div>
-          <div style="font-size:12px;opacity:0.7;margin-top:6px;">YES ask: {yes_txt} · Model: {model_txt} · Acc score: {acc_score*100:.1f}%</div>
+          <div style="font-size:12px;opacity:0.7;margin-top:6px;">YES ask: {yes_txt} · Forecast win: {model_txt} · Final rank: {acc_score*100:.1f}%</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    msg = f"Top pick: **{city} — {contract}** (accuracy-first score **{acc_score*100:.1f}%**)"
+    msg = f"Top pick: **{city} — {contract}** (Final rank **{acc_score*100:.1f}%**)"
     if odds_str:
         msg += f" · Odds: **{odds_str}**"
     st.success(msg)
@@ -478,11 +478,11 @@ def compute_city_snapshot(city_name: str, fast: bool = False):
     try:
         bucket_markets = pe.get_today_bucket_markets()
     except Exception as e:
-        empty = pd.DataFrame(columns=["Contract", "YES ask %", "Odds", "Volume", "Value %", "Model %"])
+        empty = pd.DataFrame(columns=["Contract", "YES ask %", "Odds", "Volume", "Value %", "Forecast win %"])
         return empty, None, sigma, [], str(e)
 
     if not bucket_markets:
-        empty = pd.DataFrame(columns=["Contract", "YES ask %", "Odds", "Volume", "Value %", "Model %"])
+        empty = pd.DataFrame(columns=["Contract", "YES ask %", "Odds", "Volume", "Value %", "Forecast win %"])
         return empty, None, sigma, [], "No market data"
 
     labels = [bm["label"] for bm in bucket_markets]
@@ -492,7 +492,7 @@ def compute_city_snapshot(city_name: str, fast: bool = False):
     try:
         probs = pe.model_probs_for_buckets(bucket_bounds, sigma)
     except Exception as e:
-        empty = pd.DataFrame(columns=["Contract", "YES ask %", "Odds", "Volume", "Value %", "Model %"])
+        empty = pd.DataFrame(columns=["Contract", "YES ask %", "Odds", "Volume", "Value %", "Forecast win %"])
         return empty, None, sigma, labels, str(e)
 
     rows = []
@@ -517,7 +517,7 @@ def compute_city_snapshot(city_name: str, fast: bool = False):
             "Odds": fmt_american(odds),
             "Volume": vol,
             "Value %": None if value is None else value * 100.0,
-            "Model %": p_model * 100.0,
+            "Forecast win %": p_model * 100.0,
         })
 
     df = pd.DataFrame(rows)
@@ -534,12 +534,12 @@ def compute_city_snapshot(city_name: str, fast: bool = False):
     # 2) Otherwise: accuracy-first, lightly market-blended.
     #    Score = 0.90*Model + 0.10*Market(YES ask). Value% only breaks ties.
     if best is None:
-        cand = df.dropna(subset=["Model %", "YES ask %"]).copy()
+        cand = df.dropna(subset=["Forecast win %", "YES ask %"]).copy()
         # Exclude "not worth betting" heavy favorites (odds <= -300)
         if "Odds" in cand.columns:
             cand = cand[~cand["Odds"].apply(is_odds_too_expensive)].copy()
         if len(cand):
-            cand["_model_p"] = pd.to_numeric(cand["Model %"], errors="coerce") / 100.0
+            cand["_model_p"] = pd.to_numeric(cand["Forecast win %"], errors="coerce") / 100.0
             cand["_mkt_p"] = pd.to_numeric(cand["YES ask %"], errors="coerce") / 100.0
             cand["_value_p"] = pd.to_numeric(cand.get("Value %", 0.0), errors="coerce").fillna(0.0) / 100.0
             cand = cand.dropna(subset=["_model_p", "_mkt_p"]).copy()
@@ -708,15 +708,18 @@ load_status.empty()
 
 lb = pd.DataFrame(leader_rows)
 
+# Rename leaderboard columns for clarity
+lb = lb.rename(columns={"Acc score %": "Final rank %", "Model %": "Forecast win %"})
+
 # Ensure numeric columns are real numbers (None -> NaN) so Styler formatters
 # don't crash with "unsupported format string passed to NoneType".
-for _col in ["Acc score %", "Value %", "YES ask %", "Model %", "σ"]:
+for _col in ["Final rank %", "Value %", "YES ask %", "Forecast win %", "σ"]:
     if _col in lb.columns:
         lb[_col] = pd.to_numeric(lb[_col], errors="coerce")
 
 # Rank cities by accuracy-first score (fallback to Value% if missing)
-if "Acc score %" in lb.columns:
-    lb["_sort"] = lb["Acc score %"].fillna(-1e18)
+if "Final rank %" in lb.columns:
+    lb["_sort"] = lb["Final rank %"].fillna(-1e18)
 else:
     lb["_sort"] = lb["Value %"].fillna(-1e18)
 lb = lb.sort_values("_sort", ascending=False).drop(columns=["_sort"])
@@ -741,8 +744,8 @@ _cols = [
     "City",
     "Status",
     "Best contract",
-    "Acc score %",
-    "Model %",
+    "Final rank %",
+    "Forecast win %",
     "YES ask %",
     "Value %",
     "Odds",
@@ -765,12 +768,16 @@ if errs:
 styled_lb = (
     lb.style
       .format(
-          {"Acc score %": "{:.1f}%", "Value %": "{:+.1f}%", "YES ask %": "{:.1f}%", "Model %": "{:.1f}%", "σ": "{:.2f}"},
+          {"Final rank %": "{:.1f}%", "Value %": "{:+.1f}%", "YES ask %": "{:.1f}%", "Forecast win %": "{:.1f}%", "σ": "{:.2f}"},
           na_rep="—",
       )
       .map(value_color, subset=["Value %"])
 )
 
+st.caption(
+    "Legend: Forecast win% = model-only probability. Final rank% = 90% model + 10% market (YES ask). "
+    "Value% = (Forecast − Price)."
+)
 st.subheader("Best bet by city (ranked)")
 st.caption(f"Odds guardrails: exclude favorites <= {ODDS_EXCLUDE_FAVORITE_AT_OR_BELOW} · warn longshots >= +{ODDS_WARN_LONGSHOT_AT_OR_ABOVE}")
 st.dataframe(styled_lb, width="stretch", hide_index=True)
@@ -796,15 +803,15 @@ if err_city:
 if df_city is None or df_city.empty:
     st.info("No bucket data returned right now for this city.")
 else:
-    st.caption(f"{city_pick} — σ(auto): {sigma_city:.2f}°F  |  Price = YES ask  |  Value = Model − Price")
+    st.caption(f"{city_pick} — σ(auto): {sigma_city:.2f}°F  |  Price = YES ask  |  Value = Forecast − Price")
 
-    table = df_city[["Contract", "YES ask %", "Odds", "Volume", "Value %", "Model %"]].copy()
+    table = df_city[["Contract", "YES ask %", "Odds", "Volume", "Value %", "Forecast win %"]].copy()
     table["Volume"] = pd.to_numeric(table["Volume"], errors="coerce")
     table["⚠️"] = table["Odds"].apply(lambda s: "⚠️" if is_odds_longshot(s) else "")
 
     styled = (
         table.style
-          .format({"YES ask %": "{:.1f}%", "Volume": "{:,.0f}", "Value %": "{:+.1f}%", "Model %": "{:.1f}%"})
+          .format({"YES ask %": "{:.1f}%", "Volume": "{:,.0f}", "Value %": "{:+.1f}%", "Forecast win %": "{:.1f}%"})
           .map(value_color, subset=["Value %"])
     )
 
@@ -910,7 +917,17 @@ except Exception as e:
 # -----------------------
 if hasattr(pe, "perf_load_df"):
     st.subheader("Historical performance")
-    perf = pe.perf_load_df()
+    if not os.path.exists(perf_path):
+        st.info(
+            "No performance.csv found on this server, so there’s no history to show. "
+            "Your local tracker writes to data/performance.csv on your machine; the live site won’t see that file unless you "
+            "persist it (e.g., commit it, upload it to storage, or run tracking on the server)."
+        )
+    try:
+        perf = pe.perf_load_df()
+    except Exception as e:
+        st.error(f"Failed to load performance history: {e}")
+        perf = pd.DataFrame()
     done = perf.dropna(subset=["observed_high_f", "profit", "won"]).copy()
 
     if done.empty:
@@ -1037,7 +1054,7 @@ if hasattr(pe, "perf_load_df"):
             if "yes_ask_prob" in d.columns:
                 d["YES ask %"] = (pd.to_numeric(d["yes_ask_prob"], errors="coerce") * 100).round(1)
             if "model_prob" in d.columns:
-                d["Model %"] = (pd.to_numeric(d["model_prob"], errors="coerce") * 100).round(1)
+                d["Forecast win %"] = (pd.to_numeric(d["model_prob"], errors="coerce") * 100).round(1)
             if "value_prob" in d.columns:
                 d["Value %"] = (pd.to_numeric(d["value_prob"], errors="coerce") * 100).round(1)
             if "profit" in d.columns:
@@ -1046,7 +1063,7 @@ if hasattr(pe, "perf_load_df"):
             cols = [
                 c for c in [
                     "date", "strategy", "best_contract", "winning_contract",
-                    "observed_high_f", "YES ask %", "Model %", "Value %", "won", "Profit %"
+                    "observed_high_f", "YES ask %", "Forecast win %", "Value %", "won", "Profit %"
                 ]
                 if c in d.columns
             ]
