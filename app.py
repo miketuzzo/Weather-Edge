@@ -351,16 +351,26 @@ best_bet_slot = st.container()
 load_status = st.empty()
 load_status.info("Loading live markets… (first load can take ~10–20s)")
 
-# Update outcomes for past days (historical tracking) — cache so it doesn't run every rerun
-@st.cache_data(show_spinner=False, ttl=60*60)
-def _update_outcomes_cached():
-    if hasattr(pe, "perf_update_outcomes"):
-        try:
-            pe.perf_update_outcomes()
-        except Exception:
-            pass
 
-_update_outcomes_cached()
+# Update outcomes for past days (historical tracking)
+# IMPORTANT: surface any errors so we know why the Historical tab is empty.
+@st.cache_data(show_spinner=False, ttl=60*60)
+def _update_outcomes_cached() -> str:
+    if not hasattr(pe, "perf_update_outcomes"):
+        return ""
+    try:
+        pe.perf_update_outcomes()
+        return ""
+    except Exception as e:
+        return str(e)
+
+_outcome_err = _update_outcomes_cached()
+if _outcome_err:
+    st.warning(
+        "Historical outcome update failed (site will still load).\n"
+        "This usually means the station/NOAA fetch failed or rate-limited.\n\n"
+        f"Details: {_outcome_err}"
+    )
 
 if st.button("🔄 Refresh"):
     st.cache_data.clear()
@@ -807,7 +817,13 @@ if hasattr(pe, "perf_load_df"):
     done = perf.dropna(subset=["observed_high_f", "profit", "won"]).copy()
 
     if done.empty:
-        st.info("No settled history yet. After a day completes, outcomes will populate here.")
+        st.info(
+            "No settled history to display yet.\n\n"
+            "If you *expect* settled rows (e.g., yesterday finished), the most common causes are:\n"
+            "• outcomes couldn't be fetched from the weather source for that station/date\n"
+            "• the app container restarted and hasn't re-run outcome updates yet\n\n"
+            "Tip: refresh once, and check for a warning above about outcome-update failure."
+        )
     else:
         # Normalize types
         done["profit"] = pd.to_numeric(done["profit"], errors="coerce")
