@@ -11,3 +11,6 @@ data/performance.csv.bak.*
 
 # local virtualenv
 .venv/
+
+# python cache
+__pycache__/
