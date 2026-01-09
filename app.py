@@ -804,26 +804,149 @@ except Exception as e:
 if hasattr(pe, "perf_load_df"):
     st.subheader("Historical performance")
     perf = pe.perf_load_df()
-    done = perf.dropna(subset=["observed_high_f", "winning_contract", "profit"]).copy()
+    done = perf.dropna(subset=["observed_high_f", "profit", "won"]).copy()
 
     if done.empty:
         st.info("No settled history yet. After a day completes, outcomes will populate here.")
     else:
-        done = done.sort_values(["date","city"], ascending=[False, True])
-        done["YES ask %"] = (done["yes_ask_prob"] * 100).round(1)
-        done["Model %"] = (done["model_prob"] * 100).round(1)
-        done["Value %"] = (done["value_prob"] * 100).round(1)
-        done["Profit %"] = (done["profit"] * 100).round(1)
+        # Normalize types
+        done["profit"] = pd.to_numeric(done["profit"], errors="coerce")
+        done["won"] = pd.to_numeric(done["won"], errors="coerce")
+        done = done.dropna(subset=["profit", "won"]).copy()
 
-        show = done[["date","city","best_contract","winning_contract","observed_high_f","YES ask %","Model %","Value %","won","Profit %"]]
-        st.dataframe(show, width="stretch", hide_index=True)
+        # Ensure strategy exists
+        if "strategy" not in done.columns:
+            done["strategy"] = "lock_0930"
+        done["strategy"] = done["strategy"].fillna("lock_0930")
 
+        # Keep only the lock strategies we care about
+        keep_strats = ["lock_0930", "lock_1200"]
+        done = done[done["strategy"].isin(keep_strats)].copy()
+
+        # Limit history for speed (last N dates with settled outcomes)
+        MAX_HISTORY_DAYS = 30
+        try:
+            _recent_dates = sorted(done["date"].unique(), reverse=True)[:MAX_HISTORY_DAYS]
+            done = done[done["date"].isin(_recent_dates)].copy()
+        except Exception:
+            pass
+
+        st.markdown("### Daily summary by lock time (W–L only)")
+
+        daily = (
+            done.groupby(["date", "strategy"], as_index=False)
+                .agg(
+                    bets=("won", "count"),
+                    wins=("won", "sum"),
+                )
+        )
+
+        def _pivot_cell(df_in: pd.DataFrame, strat: str, col: str):
+            return df_in[df_in["strategy"] == strat].set_index("date")[col]
+
+        dates = pd.Index(sorted(daily["date"].unique(), reverse=True), name="date")
+        out = pd.DataFrame({"date": dates})
+
+        for strat, label in [("lock_0930", "09:30 CST"), ("lock_1200", "12:00 CST")]:
+            bets_s = _pivot_cell(daily, strat, "bets").reindex(dates)
+            wins_s = _pivot_cell(daily, strat, "wins").reindex(dates)
+
+            out[f"{label} W-L"] = [
+                "—" if pd.isna(b) else f"{int(w)}/{int(b)}"
+                for w, b in zip(wins_s, bets_s)
+            ]
+
+        wl_cols = [c for c in out.columns if c.endswith("W-L")]
+
+        def _bg_wl(s: str):
+            if not isinstance(s, str) or s == "—":
+                return ""
+            try:
+                w, b = s.split("/")
+                w = int(w); b = int(b)
+                if b == 0:
+                    return ""
+                if w == b:
+                    return "background-color: rgba(34,197,94,0.18);"
+                if w == 0:
+                    return "background-color: rgba(239,68,68,0.18);"
+                return "background-color: rgba(250,204,21,0.14);"  # yellow-ish for mixed
+            except Exception:
+                return ""
+
+        styled_out = out.style.applymap(_bg_wl, subset=wl_cols)
+        st.dataframe(styled_out, width="stretch", hide_index=True)
+
+        # ------------------------------------------------------------------
+        # Keep the detailed settled rows (optional but useful)
+        # ------------------------------------------------------------------
+        with st.expander("Show settled rows"):
+            done2 = done.copy()
+            done2 = done2.sort_values(["date", "strategy", "city"], ascending=[False, True, True])
+
+            # friendly percent columns
+            if "yes_ask_prob" in done2.columns:
+                done2["YES ask %"] = (pd.to_numeric(done2["yes_ask_prob"], errors="coerce") * 100).round(1)
+            if "model_prob" in done2.columns:
+                done2["Model %"] = (pd.to_numeric(done2["model_prob"], errors="coerce") * 100).round(1)
+            if "value_prob" in done2.columns:
+                done2["Value %"] = (pd.to_numeric(done2["value_prob"], errors="coerce") * 100).round(1)
+            done2["Profit %"] = (pd.to_numeric(done2["profit"], errors="coerce") * 100).round(2)
+
+            cols = [
+                c for c in [
+                    "date", "strategy", "city", "best_contract", "winning_contract",
+                    "observed_high_f", "YES ask %", "Model %", "Value %", "won", "Profit %"
+                ]
+                if c in done2.columns
+            ]
+            st.dataframe(done2[cols], width="stretch", hide_index=True)
+
+        # ------------------------------------------------------------------
+        # Keep city summary (still helpful)
+        # ------------------------------------------------------------------
         st.subheader("Performance by city")
-        grp = done.groupby("city").agg(
-            days=("date","count"),
-            win_rate=("won", lambda x: round(x.mean()*100, 1)),
-            avg_profit_pct=("profit", lambda x: round(x.mean()*100, 2)),
-            total_profit_pct=("profit", lambda x: round(x.sum()*100, 1)),
-        ).reset_index().sort_values("total_profit_pct", ascending=False)
+        st.caption("Win% = % of locked picks that matched the winning contract.")
 
-        st.dataframe(grp, width="stretch", hide_index=True)
+        # Provide an overall view plus per-lock views
+        tabs = st.tabs(["Overall", "09:30 CST", "12:00 CST"])
+
+        def _city_summary(df_in: pd.DataFrame) -> pd.DataFrame:
+            g = (
+                df_in.groupby("city", as_index=False)
+                    .agg(
+                        bets=("won", "count"),
+                        wins=("won", "sum"),
+                        win_rate=("won", "mean"),
+                    )
+            )
+            g["Win%"] = (pd.to_numeric(g["win_rate"], errors="coerce") * 100.0).round(1)
+            g = g.drop(columns=["win_rate"], errors="ignore")
+            g = g[["city", "bets", "wins", "Win%"]]
+            g = g.sort_values(["Win%", "wins"], ascending=[False, False])
+            g = g.rename(columns={"city": "City", "bets": "Bets", "wins": "Wins"})
+            return g
+
+        def _style_city(df_in: pd.DataFrame):
+            def _bg_win(v):
+                if v is None or (isinstance(v, float) and pd.isna(v)):
+                    return ""
+                return "background-color: rgba(34,197,94,0.18);" if v >= 50.0 else "background-color: rgba(239,68,68,0.18);"
+
+            return (
+                df_in.style
+                    .format({"Win%": "{:.1f}%"}, na_rep="—")
+                    .applymap(_bg_win, subset=["Win%"])
+            )
+
+        with tabs[0]:
+            df0 = _city_summary(done)
+            st.dataframe(_style_city(df0), width="stretch", hide_index=True)
+
+        with tabs[1]:
+            df1 = _city_summary(done[done["strategy"] == "lock_0930"].copy())
+            st.dataframe(_style_city(df1), width="stretch", hide_index=True)
+
+        with tabs[2]:
+            df2 = _city_summary(done[done["strategy"] == "lock_1200"].copy())
+            st.dataframe(_style_city(df2), width="stretch", hide_index=True)
