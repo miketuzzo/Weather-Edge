@@ -1,6 +1,7 @@
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from streamlit_autorefresh import st_autorefresh
 import altair as alt
 import philly_edge as pe
@@ -93,6 +94,7 @@ try:
 except Exception:
     pass
 
+# Set Streamlit page config
 st.set_page_config(page_title="Weather Edge", layout="centered")
 
 # Auto-refresh when open (30 minutes)
