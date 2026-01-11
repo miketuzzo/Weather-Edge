@@ -241,9 +241,9 @@ def render_overall_best_bet(snapshot_tables: dict):
     Accuracy-first, lightly market-blended; Value% used only for tiebreaks.
     """
 
-    # weights
-    W_MODEL = 0.90   # primary: model win-probability
-    W_MKT = 0.10     # secondary: market wisdom (YES ask)
+    # weights (accuracy boost): lean more on market consensus
+    W_MODEL = 0.80   # primary: model win-probability
+    W_MKT = 0.20     # secondary: market wisdom (YES ask)
 
     # Per-city tables currently use "Forecast win %" (older versions used "Model %")
     def _model_col(df_in: pd.DataFrame) -> Optional[str]:
@@ -571,7 +571,7 @@ def compute_city_snapshot(city_name: str, fast: bool = False):
             if cand.empty:
                 best = None
             if len(cand):
-                cand["_acc"] = 0.90 * cand["_model_p"] + 0.10 * cand["_mkt_p"]
+                cand["_acc"] = 0.80 * cand["_model_p"] + 0.20 * cand["_mkt_p"]
                 top = cand.sort_values(["_acc", "_model_p", "_value_p"], ascending=[False, False, False]).iloc[0]
                 best = top.to_dict()
                 try:
@@ -808,7 +808,7 @@ styled_lb = (
 )
 
 st.caption(
-    "Legend: Forecast win% = model-only probability. Final rank% = 90% model + 10% market (YES ask). "
+    "Legend: Forecast win% = model-only probability. Final rank% = 80% model + 20% market (YES ask). "
     "Value% = (Forecast − Price)."
 )
 st.subheader("Best bet by city (ranked)")
@@ -965,6 +965,142 @@ if hasattr(pe, "perf_load_df"):
     # (e.g., price/fee not captured, or older rows), so don't drop rows on profit.
     perf = perf.copy()
 
+    # --- Live settlement helper ---
+    # Deployed Streamlit often can't persist writes back to data/performance.csv,
+    # so we compute settlements in-memory for display using NOAA/NWS observed highs.
+
+    @st.cache_data(show_spinner=False, ttl=6 * 60 * 60)
+    def _obs_high_cached(date_s: str, station_icao: str, city: str):
+        try:
+            return pe._fetch_observed_daily_high(date_s, station_icao=station_icao, city=city)
+        except Exception:
+            return None
+
+    def _settle_perf_in_memory(perf_df: pd.DataFrame, max_days: int = 60) -> pd.DataFrame:
+        """Fill observed_high_f / winning_contract / won / profit for past rows in-memory.
+        Keeps Historical tab accurate even when the server can't persist file writes.
+        """
+        if perf_df is None or perf_df.empty:
+            return perf_df
+
+        df = perf_df.copy()
+
+        # Ensure required columns exist
+        for col in ["observed_high_f", "winning_contract", "won", "profit"]:
+            if col not in df.columns:
+                df[col] = pd.NA
+
+        # Normalize date to string YYYY-MM-DD
+        df["date"] = df["date"].astype(str)
+
+        # Only attempt to settle recent days (keeps it fast)
+        try:
+            uniq_dates = sorted(df["date"].dropna().unique().tolist(), reverse=True)[:max_days]
+            df = df[df["date"].isin(uniq_dates)].copy()
+        except Exception:
+            pass
+
+        # Fill observed highs for rows missing them
+        obs_series = pd.to_numeric(df["observed_high_f"], errors="coerce")
+        missing_mask = obs_series.isna()
+
+        if missing_mask.any():
+            # Determine station per row (prefer explicit station column; else map from city)
+            if "station" in df.columns:
+                stations = df["station"].astype(str)
+            else:
+                stations = df["city"].map(lambda c: CITIES.get(str(c), {}).get("station_obs", ""))
+
+            for idx in df[missing_mask].index:
+                date_s = str(df.at[idx, "date"])
+                city = str(df.at[idx, "city"]) if "city" in df.columns else ""
+                station = str(stations.at[idx]) if idx in stations.index else ""
+                if not station:
+                    station = CITIES.get(city, {}).get("station_obs", "")
+                if not station:
+                    continue
+
+                obs = _obs_high_cached(date_s, station, city)
+                if obs is None:
+                    continue
+
+                try:
+                    df.at[idx, "observed_high_f"] = float(obs)
+                except Exception:
+                    df.at[idx, "observed_high_f"] = pd.NA
+
+        # Normalize observed highs to numeric
+        df["observed_high_f"] = pd.to_numeric(df["observed_high_f"], errors="coerce")
+
+        # Recompute winning contract when possible (using labels_json)
+        if "labels_json" in df.columns:
+            def _parse_bucket_label(lbl: str):
+                if not isinstance(lbl, str):
+                    return None
+                s = lbl.strip().replace("º", "°")
+                s = re.sub(r"\s+", " ", s)
+
+                m = re.match(r"^(\-?\d+)\s*°\s*to\s*(\-?\d+)\s*°$", s)
+                if m:
+                    return (float(m.group(1)), float(m.group(2)), "range")
+
+                m = re.match(r"^(\-?\d+)\s*°\s*or\s*below$", s)
+                if m:
+                    return (None, float(m.group(1)), "below")
+
+                m = re.match(r"^(\-?\d+)\s*°\s*or\s*above$", s)
+                if m:
+                    return (float(m.group(1)), None, "above")
+
+                return None
+
+            def _winner_from_observed(obs_f: float, labels_json: str):
+                if obs_f is None or (isinstance(obs_f, float) and pd.isna(obs_f)):
+                    return None
+                try:
+                    labels = json.loads(labels_json) if isinstance(labels_json, str) else None
+                except Exception:
+                    labels = None
+                if not isinstance(labels, list) or not labels:
+                    return None
+
+                x = float(obs_f)
+                for lbl in labels:
+                    spec = _parse_bucket_label(str(lbl))
+                    if spec is None:
+                        continue
+                    lo, hi, kind = spec
+                    if kind == "range" and (x >= lo) and (x <= hi):
+                        return str(lbl)
+                    if kind == "below" and (x <= hi):
+                        return str(lbl)
+                    if kind == "above" and (x >= lo):
+                        return str(lbl)
+                return None
+
+            df["computed_winning_contract"] = [
+                _winner_from_observed(o, lj)
+                for o, lj in zip(df.get("observed_high_f"), df.get("labels_json"))
+            ]
+
+            comp = pd.Series(df["computed_winning_contract"], index=df.index)
+            df["winning_contract"] = comp.where(comp.notna(), df.get("winning_contract"))
+
+        # Recompute win flag from best_contract vs winner
+        if "best_contract" in df.columns:
+            df["won"] = (
+                df["best_contract"].astype(str) == df["winning_contract"].astype(str)
+            ).astype(float)
+
+        # Recompute profit if we have yes_ask_prob (price) and won
+        # Profit per $1 YES contract: win => (1 - price), lose => (-price)
+        if "yes_ask_prob" in df.columns:
+            price = pd.to_numeric(df["yes_ask_prob"], errors="coerce")
+            won = pd.to_numeric(df["won"], errors="coerce")
+            df["profit"] = won * (1 - price) + (1 - won) * (-price)
+
+        return df
+
     # Normalize strategy labels so 09:30 and 12:00 always group correctly
     if "strategy" not in perf.columns:
         perf["strategy"] = "lock_0930"
@@ -995,15 +1131,28 @@ if hasattr(pe, "perf_load_df"):
         except Exception as _e:
             st.write(f"(debug failed: {_e})")
 
-    # Use only rows that have observed highs; we will recompute wins independently
-    done = perf[pd.to_numeric(perf.get("observed_high_f"), errors="coerce").notna()].copy()
+    # Compute settlements in-memory so the deployed site can still show true history
+    perf = _settle_perf_in_memory(perf, max_days=60)
+
+    # Use only rows that have observed highs
+    if "observed_high_f" in perf.columns:
+        _obs = pd.to_numeric(perf["observed_high_f"], errors="coerce")
+    else:
+        _obs = pd.Series([float("nan")] * len(perf), index=perf.index)
+
+    settled_count = int(_obs.notna().sum()) if len(perf) else 0
+    total_count = int(len(perf))
+
+    st.caption(f"History rows present: {total_count} (settled: {settled_count})")
+
+    done = perf[_obs.notna()].copy()
 
     if done.empty:
         st.info(
             "No settled history to display yet.\n\n"
             "If you *expect* settled rows (e.g., yesterday finished), the most common causes are:\n"
-            "• outcomes couldn't be fetched from the weather source for that station/date\n"
-            "• the app container restarted and hasn't re-run outcome updates yet\n\n"
+            "• NOAA/NWS observed high fetch failed for that station/date\n"
+            "• the date is too recent and hasn't published final daily max yet\n\n"
             "Tip: refresh once, and check for a warning above about outcome-update failure."
         )
     else:
@@ -1014,96 +1163,6 @@ if hasattr(pe, "perf_load_df"):
         # Strategy already normalized above; keep only the lock strategies we care about
         keep_strats = ["lock_0930", "lock_1200"]
         done = done[done["strategy"].isin(keep_strats)].copy()
-
-        # --- Long-term accuracy: recompute winners + W/L from observed high and saved bucket labels ---
-        def _parse_bucket_label(lbl: str):
-            """Return (lo, hi, kind) where kind is one of: 'range', 'below', 'above'."""
-            if not isinstance(lbl, str):
-                return None
-            s = lbl.strip()
-            s = s.replace("º", "°")
-            s = re.sub(r"\s+", " ", s)
-
-            m = re.match(r"^(\-?\d+)\s*°\s*to\s*(\-?\d+)\s*°$", s)
-            if m:
-                lo = float(m.group(1))
-                hi = float(m.group(2))
-                return (lo, hi, "range")
-
-            m = re.match(r"^(\-?\d+)\s*°\s*or\s*below$", s)
-            if m:
-                hi = float(m.group(1))
-                return (None, hi, "below")
-
-            m = re.match(r"^(\-?\d+)\s*°\s*or\s*above$", s)
-            if m:
-                lo = float(m.group(1))
-                return (lo, None, "above")
-
-            return None
-
-        def _winner_from_observed(obs_f: float, labels_json: str) -> Optional[str]:
-            """Compute which bucket label contains the observed high (independent check)."""
-            if obs_f is None or (isinstance(obs_f, float) and pd.isna(obs_f)):
-                return None
-            try:
-                labels = json.loads(labels_json) if isinstance(labels_json, str) else None
-            except Exception:
-                labels = None
-            if not isinstance(labels, list) or not labels:
-                return None
-
-            x = float(obs_f)
-            for lbl in labels:
-                spec = _parse_bucket_label(str(lbl))
-                if spec is None:
-                    continue
-                lo, hi, kind = spec
-                if kind == "range":
-                    if (x >= lo) and (x <= hi):
-                        return str(lbl)
-                elif kind == "below":
-                    if x <= hi:
-                        return str(lbl)
-                elif kind == "above":
-                    if x >= lo:
-                        return str(lbl)
-            return None
-
-        # If we have labels_json + best_contract, recompute winning bucket and win/loss.
-        if "labels_json" in done.columns:
-            done["computed_winning_contract"] = [
-                _winner_from_observed(o, lj)
-                for o, lj in zip(done.get("observed_high_f"), done.get("labels_json"))
-            ]
-        else:
-            done["computed_winning_contract"] = None
-
-        # Prefer computed winner; fall back to stored winning_contract if computed missing
-        if "winning_contract" in done.columns:
-            done["winning_contract_true"] = done["computed_winning_contract"].where(
-                done["computed_winning_contract"].notna(),
-                done["winning_contract"],
-            )
-        else:
-            done["winning_contract_true"] = done["computed_winning_contract"]
-
-        # Recompute win flag from best_contract vs winner
-        if "best_contract" in done.columns:
-            done["won_true"] = (
-                done["best_contract"].astype(str) == done["winning_contract_true"].astype(str)
-            ).astype(float)
-        else:
-            # If missing best_contract, fall back to stored won
-            done["won_true"] = pd.to_numeric(done.get("won"), errors="coerce")
-
-        # Make sure won_true is numeric and never missing for aggregation
-        done["won_true"] = pd.to_numeric(done["won_true"], errors="coerce")
-
-        # Track whether the stored win flag disagrees with recomputed
-        done["won_mismatch"] = (
-            pd.to_numeric(done.get("won"), errors="coerce") != pd.to_numeric(done["won_true"], errors="coerce")
-        )
 
         # Limit history for speed (last N dates with settled outcomes)
         MAX_HISTORY_DAYS = 30
@@ -1126,8 +1185,8 @@ if hasattr(pe, "perf_load_df"):
         daily = (
             done.groupby(["date", "strategy"], as_index=False)
                 .agg(
-                    bets=("won_true", "count"),
-                    wins=("won_true", "sum"),
+                    bets=("won", "count"),
+                    wins=("won", "sum"),
                 )
         )
 
@@ -1176,18 +1235,14 @@ if hasattr(pe, "perf_load_df"):
 
             ddf = done[(done["date"].astype(str) == str(drill_date)) & (done["strategy"] == drill_strat)].copy()
 
-            # Ensure we have a winning contract column to display
-            if "winning_contract_true" not in ddf.columns:
-                ddf["winning_contract_true"] = ddf.get("winning_contract")
-
             # Display columns: City, Pick, Actual winner, Observed high
-            show = ddf[[c for c in ["city", "best_contract", "winning_contract_true", "observed_high_f", "won_true"] if c in ddf.columns]].copy()
+            show = ddf[[c for c in ["city", "best_contract", "winning_contract", "observed_high_f", "won"] if c in ddf.columns]].copy()
             show = show.rename(columns={
                 "city": "City",
                 "best_contract": "Pick",
-                "winning_contract_true": "Winning contract",
+                "winning_contract": "Winning contract",
                 "observed_high_f": "Observed high (°F)",
-                "won_true": "Won",
+                "won": "Won",
             })
 
             # Style: green row if won, red if lost
@@ -1226,9 +1281,9 @@ if hasattr(pe, "perf_load_df"):
             g = (
                 df_in.groupby("city", as_index=False)
                     .agg(
-                        bets=("won_true", "count"),
-                        wins=("won_true", "sum"),
-                        win_rate=("won_true", "mean"),
+                        bets=("won", "count"),
+                        wins=("won", "sum"),
+                        win_rate=("won", "mean"),
                     )
             )
             g["Win%"] = (pd.to_numeric(g["win_rate"], errors="coerce") * 100.0).round(1)
@@ -1257,23 +1312,20 @@ if hasattr(pe, "perf_load_df"):
             d = d.sort_values(["date", "strategy"], ascending=[False, True])
 
             # Only show the minimal settled-row fields for legibility
-            if "winning_contract_true" not in d.columns:
-                d["winning_contract_true"] = d.get("winning_contract")
-
             cols = [
                 c for c in [
                     "date",
                     "strategy",
                     "best_contract",
-                    "winning_contract_true",
+                    "winning_contract",
                     "observed_high_f",
-                    "won_true",
+                    "won",
                 ]
                 if c in d.columns
             ]
             out = d[cols].copy()
             out = out.rename(columns={
-                "winning_contract_true": "winning_contract",
+                "winning_contract": "winning_contract",
                 "observed_high_f": "observed_high_f",
             })
             return out
@@ -1305,7 +1357,7 @@ if hasattr(pe, "perf_load_df"):
                 return
 
             # Color the observed high cell green/red depending on win/loss
-            if "won_true" in rows.columns:
+            if "won" in rows.columns:
                 rows2 = rows.copy()
 
                 def _bg_obs_cell(_v, _won):
@@ -1317,11 +1369,11 @@ if hasattr(pe, "perf_load_df"):
                     # s is a Series for the observed_high_f column
                     return [
                         _bg_obs_cell(v, w)
-                        for v, w in zip(rows2.get("observed_high_f"), rows2.get("won_true"))
+                        for v, w in zip(rows2.get("observed_high_f"), rows2.get("won"))
                     ]
 
-                # Hide won_true from the table, but keep it for styling
-                display_cols = [c for c in rows2.columns if c != "won_true"]
+                # Hide won from the table, but keep it for styling
+                display_cols = [c for c in rows2.columns if c != "won"]
                 st.dataframe(
                     rows2[display_cols].style.format({"observed_high_f": "{:.1f}"}, na_rep="—").apply(_style_obs, subset=["observed_high_f"]),
                     width="stretch",
