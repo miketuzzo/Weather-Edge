@@ -14,4 +14,3 @@ data/performance.csv.bak.*
 
 # python cache
 __pycache__/
-data/performance.csv

@@ -601,6 +601,9 @@ leader_rows = []
 snapshots = {}
 
 # Prepare lock directory and lock file paths (two lock times)
+# IMPORTANT: We do NOT create lock files until we successfully log at least one row.
+# Otherwise a transient API failure (or best=None) can "burn" the day and prevent later runs (cron/track.py)
+# from logging the missing rows.
 lock_dir = os.path.join("data", "locks")
 os.makedirs(lock_dir, exist_ok=True)
 
@@ -613,24 +616,13 @@ locked_1200 = os.path.isfile(lock_file_1200)
 after_0930 = is_after_lock_cst()
 after_1200 = is_after_lock2_cst()
 
-DO_LOCK_0930 = False
-DO_LOCK_1200 = False
+# We intend to log if we're past the lock time and not already locked.
+DO_LOCK_0930 = bool(after_0930 and not locked_0930)
+DO_LOCK_1200 = bool(after_1200 and not locked_1200)
 
-if after_0930 and not locked_0930:
-    try:
-        with open(lock_file_0930, "w") as f:
-            f.write(f"Locked picks for {lock_date_str_cst()} 09:30 CST\n")
-        DO_LOCK_0930 = True
-    except Exception:
-        DO_LOCK_0930 = False
-
-if after_1200 and not locked_1200:
-    try:
-        with open(lock_file_1200, "w") as f:
-            f.write(f"Locked picks for {lock_date_str_cst()} 12:00 CST\n")
-        DO_LOCK_1200 = True
-    except Exception:
-        DO_LOCK_1200 = False
+# Track whether we actually logged anything; only then do we create the lock file.
+logged_any_0930 = False
+logged_any_1200 = False
 
 for city_name in CITIES.keys():
     df, best, sigma, labels, err = compute_city_snapshot(city_name, fast=True)
@@ -685,6 +677,7 @@ for city_name in CITIES.keys():
                 value_prob=(best.get("Value %")/100.0 if best.get("Value %") is not None else None),
                 strategy="lock_0930",
             )
+            logged_any_0930 = True
         except Exception:
             pass
 
@@ -702,6 +695,7 @@ for city_name in CITIES.keys():
                 value_prob=(best.get("Value %")/100.0 if best.get("Value %") is not None else None),
                 strategy="lock_1200",
             )
+            logged_any_1200 = True
         except Exception:
             pass
 
@@ -727,6 +721,21 @@ for city_name in CITIES.keys():
             "Odds": best.get("Odds", ""),
             "σ": sigma,
         })
+#
+# Create lock files only if we successfully logged at least one row.
+if DO_LOCK_0930 and (not locked_0930) and logged_any_0930:
+    try:
+        with open(lock_file_0930, "w") as f:
+            f.write(f"Locked picks for {lock_date_str_cst()} 09:30 CST\n")
+    except Exception:
+        pass
+
+if DO_LOCK_1200 and (not locked_1200) and logged_any_1200:
+    try:
+        with open(lock_file_1200, "w") as f:
+            f.write(f"Locked picks for {lock_date_str_cst()} 12:00 CST\n")
+    except Exception:
+        pass
 
 load_status.empty()
 
@@ -952,8 +961,42 @@ if hasattr(pe, "perf_load_df"):
     except Exception as e:
         st.error(f"Failed to load performance history: {e}")
         perf = pd.DataFrame()
-    # Use only rows that have observed highs + profit; we will recompute wins independently
-    done = perf.dropna(subset=["observed_high_f", "profit"]).copy()
+    # Treat a row as "settled" if we have an observed high. Profit may legitimately be NaN
+    # (e.g., price/fee not captured, or older rows), so don't drop rows on profit.
+    perf = perf.copy()
+
+    # Normalize strategy labels so 09:30 and 12:00 always group correctly
+    if "strategy" not in perf.columns:
+        perf["strategy"] = "lock_0930"
+    perf["strategy"] = (
+        perf["strategy"]
+            .astype(str)
+            .fillna("lock_0930")
+            .str.strip()
+            .str.lower()
+    )
+    perf["strategy"] = perf["strategy"].replace({
+        "lock0930": "lock_0930",
+        "lock-0930": "lock_0930",
+        "0930": "lock_0930",
+        "lock1200": "lock_1200",
+        "lock-1200": "lock_1200",
+        "1200": "lock_1200",
+        "noon": "lock_1200",
+    })
+
+    # Debug visibility (kept compact): helps confirm whether 12:00 rows exist on the live server
+    with st.expander("Debug: history rows by strategy (raw)"):
+        try:
+            st.write(perf["strategy"].value_counts(dropna=False))
+            if "observed_high_f" in perf.columns:
+                st.write("Settled rows (observed_high_f present) by strategy")
+                st.write(perf.loc[pd.to_numeric(perf["observed_high_f"], errors="coerce").notna(), "strategy"].value_counts(dropna=False))
+        except Exception as _e:
+            st.write(f"(debug failed: {_e})")
+
+    # Use only rows that have observed highs; we will recompute wins independently
+    done = perf[pd.to_numeric(perf.get("observed_high_f"), errors="coerce").notna()].copy()
 
     if done.empty:
         st.info(
@@ -968,11 +1011,7 @@ if hasattr(pe, "perf_load_df"):
         done["profit"] = pd.to_numeric(done["profit"], errors="coerce")
         if "won" in done.columns:
             done["won"] = pd.to_numeric(done["won"], errors="coerce")
-        # Ensure strategy exists
-        if "strategy" not in done.columns:
-            done["strategy"] = "lock_0930"
-        done["strategy"] = done["strategy"].fillna("lock_0930")
-        # Keep only the lock strategies we care about
+        # Strategy already normalized above; keep only the lock strategies we care about
         keep_strats = ["lock_0930", "lock_1200"]
         done = done[done["strategy"].isin(keep_strats)].copy()
 
@@ -1057,6 +1096,9 @@ if hasattr(pe, "perf_load_df"):
         else:
             # If missing best_contract, fall back to stored won
             done["won_true"] = pd.to_numeric(done.get("won"), errors="coerce")
+
+        # Make sure won_true is numeric and never missing for aggregation
+        done["won_true"] = pd.to_numeric(done["won_true"], errors="coerce")
 
         # Track whether the stored win flag disagrees with recomputed
         done["won_mismatch"] = (
