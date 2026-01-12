@@ -5,6 +5,11 @@ import streamlit.components.v1 as components
 from streamlit_autorefresh import st_autorefresh
 import altair as alt
 import philly_edge as pe
+
+# NOTE: Picks are now computed via pe.compute_pick_for_today()
+# This includes strategy-aware sigma, EWMA bias correction,
+# accuracy-gated + EV-aware selection, and no-bet handling.
+
 from datetime import datetime, timezone
 import time
 from zoneinfo import ZoneInfo
@@ -483,7 +488,7 @@ if st.button("🔄 Refresh"):
     st.rerun()
 
 @st.cache_data(show_spinner=False, ttl=120)
-def compute_city_snapshot(city_name: str, fast: bool = False):
+def compute_city_snapshot(city_name: str, strategy: str = "lock_0930", fast: bool = False):
     """
     Returns:
       df (DataFrame): per-bucket table (may be empty)
@@ -494,7 +499,8 @@ def compute_city_snapshot(city_name: str, fast: bool = False):
     """
     cfg = CITIES[city_name]
     apply_city(cfg)
-    sigma = 2.0 if fast else get_city_sigma(city_name)
+    sigma_base = 2.0 if fast else get_city_sigma(city_name)
+    sigma = pe.sigma_for_strategy(strategy, base_sigma_f=sigma_base) if hasattr(pe, "sigma_for_strategy") else sigma_base
 
     # Fetch markets (can fail if env vars missing / API issues)
     try:
@@ -512,7 +518,9 @@ def compute_city_snapshot(city_name: str, fast: bool = False):
 
     # Model probabilities (best effort but should usually work)
     try:
-        probs = pe.model_probs_for_buckets(bucket_bounds, sigma)
+        result = pe.compute_pick_for_today(city=city_name, strategy=strategy)  # UPDATED
+        probs = result['probs']
+        # old: pe.model_probs_for_buckets(bucket_bounds, sigma)
     except Exception as e:
         empty = pd.DataFrame(columns=["Contract", "YES ask %", "Odds", "Volume", "Value %", "Forecast win %"])
         return empty, None, sigma, labels, str(e)
@@ -592,6 +600,28 @@ def compute_city_snapshot(city_name: str, fast: bool = False):
             best = cand.sort_values("Value %", ascending=False).iloc[0].to_dict()
             best["Acc score %"] = None
 
+    # Override UI/leaderboard 'best' with engine pick (gated + EV-aware), when available
+    try:
+        engine_pick = result.get("pick") if isinstance(result, dict) else None
+        market_bad = bool(result.get("market_bad", False)) if isinstance(result, dict) else False
+        if market_bad or (engine_pick is None):
+            best = None
+        else:
+            label = engine_pick.get("label")
+            sub = df[df["Contract"].astype(str) == str(label)]
+            if len(sub):
+                best = sub.iloc[0].to_dict()
+                bp = engine_pick.get("blend_p")
+                if bp is not None:
+                    try:
+                        best["Acc score %"] = float(bp) * 100.0
+                    except Exception:
+                        pass
+            else:
+                best = {"Contract": label, "Acc score %": None}
+    except Exception:
+        pass
+
     return df, best, sigma, labels, ""
 
 # -----------------------
@@ -620,12 +650,15 @@ after_1200 = is_after_lock2_cst()
 DO_LOCK_0930 = bool(after_0930 and not locked_0930)
 DO_LOCK_1200 = bool(after_1200 and not locked_1200)
 
+# Use noon strategy after 12:00 CST for live tables
+DISPLAY_STRATEGY = "lock_1200" if after_1200 else "lock_0930"
+
 # Track whether we actually logged anything; only then do we create the lock file.
 logged_any_0930 = False
 logged_any_1200 = False
 
 for city_name in CITIES.keys():
-    df, best, sigma, labels, err = compute_city_snapshot(city_name, fast=True)
+    df, best, sigma, labels, err = compute_city_snapshot(city_name, strategy=DISPLAY_STRATEGY, fast=True)
     snapshots[city_name] = (df, sigma, labels, err)
 
     # Append snapshot row for each city if possible
@@ -663,41 +696,61 @@ for city_name in CITIES.keys():
                 pass
 
     # Log official (graded) picks at lock times once per day (9:30 CST and 12:00 CST)
-    if DO_LOCK_0930 and hasattr(pe, "perf_log_snapshot") and best is not None:
+    if DO_LOCK_0930 and hasattr(pe, "perf_log_snapshot"):
+        cfg_l = CITIES[city_name]
+        apply_city(cfg_l)
         try:
-            pe.perf_log_snapshot(
-                date_s=pe._today_local_date_str(),
-                city=city_name,
-                station=CITIES[city_name]["station_obs"],
-                sigma_f=sigma,
-                labels=labels,
-                best_contract=best.get("Contract"),
-                yes_ask_prob=(best.get("YES ask %")/100.0 if best.get("YES ask %") is not None else None),
-                model_prob=(best.get("Forecast win %")/100.0 if best.get("Forecast win %") is not None else None),
-                value_prob=(best.get("Value %")/100.0 if best.get("Value %") is not None else None),
-                strategy="lock_0930",
-            )
-            logged_any_0930 = True
+            r_lock = pe.compute_pick_for_today(city=city_name, strategy="lock_0930")
+            pick_l = r_lock.get("pick") if isinstance(r_lock, dict) else None
+            if (pick_l is None) or bool(r_lock.get("market_bad", False)):
+                # no-bet: do not log a contract; do not burn the lock
+                pass
+            else:
+                pe.perf_log_snapshot(
+                    date_s=pe._today_local_date_str(),
+                    city=city_name,
+                    station=CITIES[city_name]["station_obs"],
+                    sigma_f=float(r_lock.get("sigma_f", 0.0) or 0.0),
+                    labels=[bm.get("label") for bm in (r_lock.get("bucket_markets") or [])] or list((r_lock.get("probs") or {}).keys()),
+                    best_contract=pick_l.get("label"),
+                    yes_ask_prob=pick_l.get("yes_ask"),
+                    model_prob=pick_l.get("model_p"),
+                    value_prob=pick_l.get("value_p"),
+                    candidates_json=json.dumps(r_lock.get("candidates", []), ensure_ascii=False),
+                    strategy="lock_0930",
+                )
+                logged_any_0930 = True
         except Exception:
             pass
 
-    if DO_LOCK_1200 and hasattr(pe, "perf_log_snapshot") and best is not None:
+
+    if DO_LOCK_1200 and hasattr(pe, "perf_log_snapshot"):
+        cfg_l = CITIES[city_name]
+        apply_city(cfg_l)
         try:
-            pe.perf_log_snapshot(
-                date_s=pe._today_local_date_str(),
-                city=city_name,
-                station=CITIES[city_name]["station_obs"],
-                sigma_f=sigma,
-                labels=labels,
-                best_contract=best.get("Contract"),
-                yes_ask_prob=(best.get("YES ask %")/100.0 if best.get("YES ask %") is not None else None),
-                model_prob=(best.get("Forecast win %")/100.0 if best.get("Forecast win %") is not None else None),
-                value_prob=(best.get("Value %")/100.0 if best.get("Value %") is not None else None),
-                strategy="lock_1200",
-            )
-            logged_any_1200 = True
+            r_lock = pe.compute_pick_for_today(city=city_name, strategy="lock_1200")
+            pick_l = r_lock.get("pick") if isinstance(r_lock, dict) else None
+            if (pick_l is None) or bool(r_lock.get("market_bad", False)):
+                # no-bet: do not log a contract; do not burn the lock
+                pass
+            else:
+                pe.perf_log_snapshot(
+                    date_s=pe._today_local_date_str(),
+                    city=city_name,
+                    station=CITIES[city_name]["station_obs"],
+                    sigma_f=float(r_lock.get("sigma_f", 0.0) or 0.0),
+                    labels=[bm.get("label") for bm in (r_lock.get("bucket_markets") or [])] or list((r_lock.get("probs") or {}).keys()),
+                    best_contract=pick_l.get("label"),
+                    yes_ask_prob=pick_l.get("yes_ask"),
+                    model_prob=pick_l.get("model_p"),
+                    value_prob=pick_l.get("value_p"),
+                    candidates_json=json.dumps(r_lock.get("candidates", []), ensure_ascii=False),
+                    strategy="lock_1200",
+                )
+                logged_any_1200 = True
         except Exception:
             pass
+
 
     if best is None:
         leader_rows.append({
@@ -717,7 +770,7 @@ for city_name in CITIES.keys():
             "Acc score %": best.get("Acc score %"),
             "Value %": best.get("Value %"),
             "YES ask %": best.get("YES ask %"),
-            "Model %": best.get("Model %"),
+            "Model %": best.get("Forecast win %"),
             "Odds": best.get("Odds", ""),
             "σ": sigma,
         })
@@ -808,11 +861,10 @@ styled_lb = (
 )
 
 st.caption(
-    "Legend: Forecast win% = model-only probability. Final rank% = 80% model + 20% market (YES ask). "
-    "Value% = (Forecast − Price)."
+    "Legend: Forecast win% = model-only win chance. Final rank% = accuracy-first (80% model + 20% market). Value% = forecast − price (not the main ranking)."
 )
 st.subheader("Best bet by city (ranked)")
-st.caption(f"Odds guardrails: exclude favorites <= {ODDS_EXCLUDE_FAVORITE_AT_OR_BELOW} · warn longshots >= +{ODDS_WARN_LONGSHOT_AT_OR_ABOVE}")
+st.caption(f"Odds guardrails: excluded heavy favorites (<= {ODDS_EXCLUDE_FAVORITE_AT_OR_BELOW}). ⚠️ warns longshots (>= +{ODDS_WARN_LONGSHOT_AT_OR_ABOVE}) — consider avoiding unless you have a strong edge.")
 st.dataframe(styled_lb, width="stretch", hide_index=True)
 
 # -----------------------
@@ -826,7 +878,7 @@ default_city = (
 )
 city_pick = st.selectbox("Select a city", lb["City"].tolist(), index=list(lb["City"]).index(default_city))
 
-df_city, best_city, sigma_city, _labels_city, err_city = compute_city_snapshot(city_pick, fast=False)
+df_city, best_city, sigma_city, _labels_city, err_city = compute_city_snapshot(city_pick, strategy=DISPLAY_STRATEGY, fast=False)
 cfg = CITIES[city_pick]
 st.caption(f"Settlement station: {cfg['station_label']}")
 
@@ -1086,18 +1138,24 @@ if hasattr(pe, "perf_load_df"):
             comp = pd.Series(df["computed_winning_contract"], index=df.index)
             df["winning_contract"] = comp.where(comp.notna(), df.get("winning_contract"))
 
-        # Recompute win flag from best_contract vs winner
+        # Recompute win flag from best_contract vs winner.
+        # IMPORTANT: If we don't know the winning contract yet (missing labels/highs), keep won as NA
+        # so the row is not counted as a settled bet.
         if "best_contract" in df.columns:
-            df["won"] = (
-                df["best_contract"].astype(str) == df["winning_contract"].astype(str)
-            ).astype(float)
+            bc = df["best_contract"].astype(str)
+            wc = df["winning_contract"].astype(str)
+            known = pd.to_numeric(df.get("observed_high_f"), errors="coerce").notna() & df["winning_contract"].notna() & df["best_contract"].notna()
+            df["won"] = pd.NA
+            df.loc[known, "won"] = (bc[known] == wc[known]).astype(float)
 
-        # Recompute profit if we have yes_ask_prob (price) and won
+        # Recompute profit only for settled rows where we know won and price.
         # Profit per $1 YES contract: win => (1 - price), lose => (-price)
         if "yes_ask_prob" in df.columns:
             price = pd.to_numeric(df["yes_ask_prob"], errors="coerce")
-            won = pd.to_numeric(df["won"], errors="coerce")
-            df["profit"] = won * (1 - price) + (1 - won) * (-price)
+            won_num = pd.to_numeric(df["won"], errors="coerce")
+            df["profit"] = pd.NA
+            m = won_num.notna() & price.notna()
+            df.loc[m, "profit"] = won_num[m] * (1 - price[m]) + (1 - won_num[m]) * (-price[m])
 
         return df
 
@@ -1122,14 +1180,21 @@ if hasattr(pe, "perf_load_df"):
     })
 
     # Debug visibility (kept compact): helps confirm whether 12:00 rows exist on the live server
-    with st.expander("Debug: history rows by strategy (raw)"):
-        try:
-            st.write(perf["strategy"].value_counts(dropna=False))
-            if "observed_high_f" in perf.columns:
-                st.write("Settled rows (observed_high_f present) by strategy")
-                st.write(perf.loc[pd.to_numeric(perf["observed_high_f"], errors="coerce").notna(), "strategy"].value_counts(dropna=False))
-        except Exception as _e:
-            st.write(f"(debug failed: {_e})")
+    show_debug = st.checkbox("Show debug details", value=False)
+    if show_debug:
+        with st.expander("Debug: history rows by strategy (raw)"):
+            try:
+                st.write(perf["strategy"].value_counts(dropna=False))
+                if "observed_high_f" in perf.columns:
+                    st.write("Settled rows (observed_high_f present) by strategy")
+                    st.write(
+                        perf.loc[
+                            pd.to_numeric(perf["observed_high_f"], errors="coerce").notna(),
+                            "strategy",
+                        ].value_counts(dropna=False)
+                    )
+            except Exception as _e:
+                st.write(f"(debug failed: {_e})")
 
     # Compute settlements in-memory so the deployed site can still show true history
     perf = _settle_perf_in_memory(perf, max_days=60)
@@ -1186,7 +1251,16 @@ if hasattr(pe, "perf_load_df"):
                 .agg(bets=("won", "count"), wins=("won", "sum"))
         )
 
-        dates = sorted(done["date"].dropna().astype(str).unique().tolist(), reverse=True)
+        # Include dates that have lock rows but are not settled yet (so we can show the ⏳ pending state)
+        dates_done = done["date"].dropna().astype(str).unique().tolist()
+        dates_all = (
+            perf.loc[perf["strategy"].isin(keep_strats), "date"]
+                .dropna()
+                .astype(str)
+                .unique()
+                .tolist()
+        )
+        dates = sorted(set(dates_all) | set(dates_done), reverse=True)
 
         def _wl_tuple(date_s: str, strat: str):
             sub = daily[(daily["date"].astype(str) == str(date_s)) & (daily["strategy"] == strat)]
@@ -1196,15 +1270,38 @@ if hasattr(pe, "perf_load_df"):
             w = int(float(sub.iloc[0]["wins"])) if pd.notna(sub.iloc[0]["wins"]) else 0
             return (w, b)
 
+        def _lock_state(date_s: str, strat: str):
+            """Return (has_lock_rows, has_any_settled, n_lock_rows) for a date/strategy."""
+            sub_all = perf[(perf["date"].astype(str) == str(date_s)) & (perf["strategy"] == strat)].copy()
+            if sub_all.empty:
+                return (False, False, 0)
+            obs_all = pd.to_numeric(sub_all.get("observed_high_f"), errors="coerce")
+            return (True, bool(obs_all.notna().any()), int(len(sub_all)))
+
         for d in dates[:30]:
             w0930, b0930 = _wl_tuple(d, "lock_0930")
             w1200, b1200 = _wl_tuple(d, "lock_1200")
+            has0930, settled0930, n0930 = _lock_state(d, "lock_0930")
+            has1200, settled1200, n1200 = _lock_state(d, "lock_1200")
+
+            p0930 = bool(has0930 and not settled0930)
+            p1200 = bool(has1200 and not settled1200)
+
+            # If we have lock rows but nothing settled yet, show as pending and set bet count to the number of rows (usually 7)
+            if p0930:
+                b0930 = n0930 if n0930 else (b0930 if b0930 else 7)
+            if p1200:
+                b1200 = n1200 if n1200 else (b1200 if b1200 else 7)
+
+            # If we truly have no rows, keep b=0 so the card can say "No records"
 
             st.markdown(f"#### {d}")
             c1, c2 = st.columns(2)
 
-            def _card(col, title, w, b):
-                if w >= 6:
+            def _card(col, title, w, b, pending: bool = False):
+                if pending:
+                    badge = "rgba(148,163,184,0.28)"  # stronger gray for pending
+                elif w >= 6:
                     badge = "rgba(34,197,94,0.22)"    # green (6–7 wins)
                 elif w >= 4:
                     badge = "rgba(250,204,21,0.22)"   # yellow (4–5 wins)
@@ -1215,60 +1312,99 @@ if hasattr(pe, "perf_load_df"):
                     f"""
                     <div style=\"padding:12px 14px;border-radius:14px;border:1px solid rgba(255,255,255,0.10);background:{badge};\">
                       <div style=\"font-size:13px;opacity:0.85;margin-bottom:6px;\">{title}</div>
-                      <div style=\"font-size:28px;font-weight:800;line-height:1;\">{w}/{b if b else 7}</div>
+                      <div style="font-size:28px;font-weight:800;line-height:1;">{('—' if pending else str(w))}/{(b if b else 7)}</div>
+                      <div style="font-size:12px;opacity:0.8;margin-top:6px;">{('⏳ Waiting for official highs' if pending else ('Settled' if b > 0 else 'No records'))}</div>
                     </div>
                     """,
                     unsafe_allow_html=True,
                 )
 
-            _card(c1, "🕤 09:30 CST", w0930, b0930)
-            _card(c2, "🕛 12:00 CST", w1200, b1200)
+            _card(c1, "🕤 09:30 CST", w0930, b0930, pending=p0930)
+            _card(c2, "🕛 12:00 CST", w1200, b1200, pending=p1200)
 
         # Drilldown: show the 7 city picks for a chosen date/lock
         st.markdown("### What did it pick?")
-        settled_dates = sorted(done["date"].dropna().astype(str).unique().tolist(), reverse=True)
-        if settled_dates:
-            drill_date = st.selectbox("Date", options=settled_dates, index=0, key="drill_date")
+        # Include pending days too (so you can see today's picks even before settlement)
+        dates_any = (
+            perf.loc[perf["strategy"].isin(keep_strats), "date"]
+                .dropna()
+                .astype(str)
+                .unique()
+                .tolist()
+        )
+        dates_any = sorted(dates_any, reverse=True)
+
+        if dates_any:
+            drill_date = st.selectbox("Date", options=dates_any, index=0, key="drill_date")
             drill_lock = st.selectbox("Lock time", options=["09:30 CST", "12:00 CST"], index=0, key="drill_lock")
             drill_strat = "lock_0930" if drill_lock.startswith("09") else "lock_1200"
 
-            ddf = done[(done["date"].astype(str) == str(drill_date)) & (done["strategy"] == drill_strat)].copy()
+            # Pull from perf (all rows), and then display settlement if available
+            ddf_all = perf[(perf["date"].astype(str) == str(drill_date)) & (perf["strategy"] == drill_strat)].copy()
 
-            # Display columns: City, Pick, Actual winner, Observed high
-            show = ddf[[c for c in ["city", "best_contract", "winning_contract", "observed_high_f", "won"] if c in ddf.columns]].copy()
-            show = show.rename(columns={
-                "city": "City",
-                "best_contract": "Pick",
-                "winning_contract": "Winning contract",
-                "observed_high_f": "Observed high (°F)",
-                "won": "Won",
-            })
+            if ddf_all.empty:
+                st.info("No records for that date/lock yet.")
+            else:
+                # Prefer the settled/enriched version when available (done), but keep pending rows
+                ddf_done = done[(done["date"].astype(str) == str(drill_date)) & (done["strategy"] == drill_strat)].copy()
 
-            # Style: green row if won, red if lost
-            def _bg_row_won(row):
-                v = row.get("Won")
-                try:
-                    if pd.isna(v):
+                ddf = ddf_all.copy()
+                if not ddf_done.empty:
+                    # overlay settlement columns onto the base rows by city
+                    for col in ["observed_high_f", "winning_contract", "won", "profit"]:
+                        if col in ddf_done.columns:
+                            m = dict(zip(ddf_done.get("city"), ddf_done.get(col)))
+                            if col not in ddf.columns:
+                                ddf[col] = pd.NA
+                            mapped = ddf["city"].map(m)
+                            ddf[col] = mapped.where(mapped.notna(), ddf.get(col))
+
+                show = ddf[[c for c in ["city", "best_contract", "winning_contract", "observed_high_f", "won"] if c in ddf.columns]].copy()
+                show = show.rename(columns={
+                    "city": "City",
+                    "best_contract": "Pick",
+                    "winning_contract": "Winning contract",
+                    "observed_high_f": "Observed high (°F)",
+                    "won": "Won",
+                })
+
+                obs_num = pd.to_numeric(show.get("Observed high (°F)"), errors="coerce")
+
+                if "Winning contract" in show.columns:
+                    # If no observed high yet, we are waiting for settlement
+                    show.loc[obs_num.isna(), "Winning contract"] = "⏳ Waiting for official highs"
+                    # If we have an observed high but can't compute the bucket (missing labels_json), mark as unknown
+                    unknown = obs_num.notna() & (
+                        show["Winning contract"].isna()
+                        | (show["Winning contract"].astype(str).str.strip().str.lower().isin(["nan", "none", ""]))
+                    )
+                    show.loc[unknown, "Winning contract"] = "⚠️ Unknown (missing labels)"
+
+                # Normalize observed high numeric for display
+                if "Observed high (°F)" in show.columns:
+                    show["Observed high (°F)"] = pd.to_numeric(show["Observed high (°F)"], errors="coerce")
+
+                # Style: green row if won, red if lost
+                def _bg_row_won(row):
+                    v = row.get("Won")
+                    try:
+                        # Unknown/unsettled rows: no color
+                        if v is None or pd.isna(v):
+                            return [""] * len(row)
+                        return [
+                            "background-color: rgba(34,197,94,0.14);" if float(v) >= 1.0 else "background-color: rgba(239,68,68,0.14);"
+                        ] * len(row)
+                    except Exception:
                         return [""] * len(row)
-                    return ["background-color: rgba(34,197,94,0.14);" if float(v) >= 1.0 else "background-color: rgba(239,68,68,0.14);"] * len(row)
-                except Exception:
-                    return [""] * len(row)
 
-            # Also color the observed high cell a bit stronger
-            def _bg_obs(v):
-                try:
-                    return ""
-                except Exception:
-                    return ""
-
-            styled_show = (
-                show.style
-                    .format({"Observed high (°F)": "{:.1f}"}, na_rep="—")
-                    .apply(_bg_row_won, axis=1)
-            )
-            st.dataframe(styled_show, width="stretch", hide_index=True)
+                styled_show = (
+                    show.style
+                        .format({"Observed high (°F)": "{:.1f}"}, na_rep="—")
+                        .apply(_bg_row_won, axis=1)
+                )
+                st.dataframe(styled_show, width="stretch", hide_index=True)
         else:
-            st.info("No settled dates yet.")
+            st.info("No history rows yet.")
         # ------------------------------------------------------------------
         st.subheader("Performance by city")
         st.caption("Click a city to see its settled rows. Win% = % of locked picks that matched the winning contract.")
