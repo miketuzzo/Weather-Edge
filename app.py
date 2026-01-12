@@ -1177,53 +1177,52 @@ if hasattr(pe, "perf_load_df"):
         # -------------------------
         st.markdown("### Daily results (7 cities) — 09:30 CST and 12:00 CST")
         st.caption(
-            "Each day shows how many of the 7 city picks won at each lock time. "
-            "Use the dropdown to see the exact pick vs. actual winning bucket (green = win, red = loss)."
+            "Cards show wins out of 7 for each lock time. "
+            "Use the drilldown below to see the exact pick vs. actual winning bucket (green = win, red = loss)."
         )
 
-        # Daily W/L table (one row per date)
         daily = (
             done.groupby(["date", "strategy"], as_index=False)
-                .agg(
-                    bets=("won", "count"),
-                    wins=("won", "sum"),
-                )
+                .agg(bets=("won", "count"), wins=("won", "sum"))
         )
 
-        dates = pd.Index(sorted(daily["date"].unique(), reverse=True), name="date")
-        out = pd.DataFrame({"date": dates})
+        dates = sorted(done["date"].dropna().astype(str).unique().tolist(), reverse=True)
 
-        def _wl_for(date_s: str, strat: str) -> str:
-            sub = daily[(daily["date"] == date_s) & (daily["strategy"] == strat)]
+        def _wl_tuple(date_s: str, strat: str):
+            sub = daily[(daily["date"].astype(str) == str(date_s)) & (daily["strategy"] == strat)]
             if sub.empty:
-                return "—"
-            b = float(sub.iloc[0]["bets"])
-            w = float(sub.iloc[0]["wins"])
-            if pd.isna(b) or b <= 0:
-                return "—"
-            return f"{int(w)}/{int(b)}"
+                return (0, 0)
+            b = int(float(sub.iloc[0]["bets"])) if pd.notna(sub.iloc[0]["bets"]) else 0
+            w = int(float(sub.iloc[0]["wins"])) if pd.notna(sub.iloc[0]["wins"]) else 0
+            return (w, b)
 
-        out["09:30 CST W–L"] = [ _wl_for(d, "lock_0930") for d in dates ]
-        out["12:00 CST W–L"] = [ _wl_for(d, "lock_1200") for d in dates ]
+        for d in dates[:30]:
+            w0930, b0930 = _wl_tuple(d, "lock_0930")
+            w1200, b1200 = _wl_tuple(d, "lock_1200")
 
-        def _bg_wl(s: str):
-            if not isinstance(s, str) or s == "—":
-                return ""
-            try:
-                w, b = s.split("/")
-                w = int(w); b = int(b)
-                if b <= 0:
-                    return ""
-                if w == b:
-                    return "background-color: rgba(34,197,94,0.18);"  # all green
-                if w == 0:
-                    return "background-color: rgba(239,68,68,0.18);"  # all red
-                return "background-color: rgba(250,204,21,0.14);"      # mixed yellow
-            except Exception:
-                return ""
+            st.markdown(f"#### {d}")
+            c1, c2 = st.columns(2)
 
-        wl_cols = [c for c in out.columns if c.endswith("W–L")]
-        st.dataframe(out.style.applymap(_bg_wl, subset=wl_cols), width="stretch", hide_index=True)
+            def _card(col, title, w, b):
+                if w >= 6:
+                    badge = "rgba(34,197,94,0.22)"    # green (6–7 wins)
+                elif w >= 4:
+                    badge = "rgba(250,204,21,0.22)"   # yellow (4–5 wins)
+                else:
+                    badge = "rgba(239,68,68,0.22)"    # red (0–3 wins)
+
+                col.markdown(
+                    f"""
+                    <div style=\"padding:12px 14px;border-radius:14px;border:1px solid rgba(255,255,255,0.10);background:{badge};\">
+                      <div style=\"font-size:13px;opacity:0.85;margin-bottom:6px;\">{title}</div>
+                      <div style=\"font-size:28px;font-weight:800;line-height:1;\">{w}/{b if b else 7}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+            _card(c1, "🕤 09:30 CST", w0930, b0930)
+            _card(c2, "🕛 12:00 CST", w1200, b1200)
 
         # Drilldown: show the 7 city picks for a chosen date/lock
         st.markdown("### What did it pick?")
