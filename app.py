@@ -641,6 +641,16 @@ for city_name in CITIES.keys():
     df, best, sigma, labels, err, result = compute_city_snapshot(city_name, strategy=DISPLAY_STRATEGY, fast=True)
     snapshots[city_name] = (df, sigma, labels, err)
 
+    # Confidence % (informational only; does not affect picks)
+    conf_pct = None
+    try:
+        if result is not None:
+            _c = result.get("confidence")
+            if _c is not None:
+                conf_pct = float(_c) * 100.0
+    except Exception:
+        conf_pct = None
+
     # Append snapshot row for each city if possible
     if hasattr(pe, "snap_append_row") and df is not None and not df.empty:
         cand = df.dropna(subset=["Value %"]).copy()
@@ -726,6 +736,7 @@ for city_name in CITIES.keys():
             "Value %": None,
             "YES ask %": None,
             "Model %": None,
+            "Confidence %": None,
             "Odds": "",
             "σ": sigma,
         })
@@ -737,6 +748,7 @@ for city_name in CITIES.keys():
             "Value %": best.get("Value %"),
             "YES ask %": best.get("YES ask %"),
             "Model %": best.get("Forecast win %"),
+            "Confidence %": conf_pct,
             "Odds": best.get("Odds", ""),
             "σ": sigma,
         })
@@ -765,7 +777,7 @@ lb = lb.rename(columns={"Acc score %": "Final rank %", "Model %": "Forecast win 
 
 # Ensure numeric columns are real numbers (None -> NaN) so Styler formatters
 # don't crash with "unsupported format string passed to NoneType".
-for _col in ["Final rank %", "Value %", "YES ask %", "Forecast win %", "σ"]:
+for _col in ["Final rank %", "Confidence %", "Value %", "YES ask %", "Forecast win %", "σ"]:
     if _col in lb.columns:
         lb[_col] = pd.to_numeric(lb[_col], errors="coerce")
 
@@ -797,6 +809,7 @@ _cols = [
     "Status",
     "Best contract",
     "Final rank %",
+    "Confidence %",
     "Forecast win %",
     "YES ask %",
     "Value %",
@@ -820,7 +833,7 @@ if errs:
 styled_lb = (
     lb.style
       .format(
-          {"Final rank %": "{:.1f}%", "Value %": "{:+.1f}%", "YES ask %": "{:.1f}%", "Forecast win %": "{:.1f}%", "σ": "{:.2f}"},
+          {"Final rank %": "{:.1f}%", "Confidence %": "{:.0f}%", "Value %": "{:+.1f}%", "YES ask %": "{:.1f}%", "Forecast win %": "{:.1f}%", "σ": "{:.2f}"},
           na_rep="—",
       )
       .map(value_color, subset=["Value %"])

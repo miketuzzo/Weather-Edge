@@ -2,6 +2,66 @@ from typing import Optional
 import math
 
 
+def _build_candidates_for_confidence(bucket_markets, probs: dict, alpha: float) -> list:
+    """Build a lightweight candidate list with model/market/blend/value for confidence logging."""
+    out = []
+    try:
+        for bm in (bucket_markets or []):
+            label = bm.get("label")
+            mkt = bm.get("market") or {}
+            p_model = float(probs.get(label, 0.0)) if label is not None else 0.0
+            p_mkt = None
+            try:
+                p_mkt = yes_ask_prob(mkt)  # 0..1 or None
+            except Exception:
+                p_mkt = None
+            if p_mkt is None:
+                p_blend = p_model
+                v = None
+            else:
+                p_blend = float(alpha) * p_model + (1.0 - float(alpha)) * float(p_mkt)
+                v = p_model - float(p_mkt)
+            out.append({
+                "label": str(label),
+                "model_p": p_model,
+                "market_p": (None if p_mkt is None else float(p_mkt)),
+                "blend_p": float(p_blend),
+                "value_p": (None if v is None else float(v)),
+            })
+        out.sort(key=lambda d: d.get("blend_p", 0.0), reverse=True)
+    except Exception:
+        return out
+    return out
+
+def _compute_confidence_from_candidates(candidates: list, p_min: float, ev_min: float) -> Optional[float]:
+    """0..1 confidence score for top candidate. Non-gating."""
+    try:
+        if not candidates:
+            return None
+        top = candidates[0] or {}
+        second = candidates[1] if len(candidates) > 1 else {}
+        top_blend = top.get("blend_p")
+        sec_blend = second.get("blend_p")
+        if top_blend is None:
+            top_blend = top.get("model_p")
+        if sec_blend is None:
+            sec_blend = second.get("model_p")
+        if top_blend is None:
+            return None
+        gap = 0.0 if sec_blend is None else float(top_blend) - float(sec_blend)
+        p_signal = float(top_blend)
+        margin_p = p_signal - float(p_min)
+        v = top.get("value_p")
+        margin_ev = 0.0 if v is None else float(v) - float(ev_min)
+        # simple squashed score (no extra deps)
+        z = (6.0 * gap) + (4.0 * margin_p) + (8.0 * margin_ev) - 0.5
+        import math
+        conf = 1.0 / (1.0 + math.exp(-z))
+        return max(0.0, min(1.0, float(conf)))
+    except Exception:
+        return None
+
+
 def compute_confidence(candidates: list, p_min: float, ev_min: float) -> Optional[float]:
     """Compute a 0..1 confidence score for the top candidate (non-gating).
     Uses (a) separation vs #2, (b) margin above p_min, (c) margin above ev_min.
@@ -2089,6 +2149,15 @@ def compute_pick_for_today(city: str = None,
         ev_min=float(ev_min),
     )
 
+    
+    # Build candidates + confidence (informational only)
+    try:
+        candidates = _build_candidates_for_confidence(bucket_markets, probs, alpha=float(alpha))
+        confidence = _compute_confidence_from_candidates(candidates, p_min=float(p_min), ev_min=float(ev_min))
+    except Exception:
+        candidates = []
+        confidence = None
+
     return {
         "strategy": strat,
         "sigma_f": float(sigma_f),
@@ -2097,4 +2166,6 @@ def compute_pick_for_today(city: str = None,
         "probs": probs,
         "pick": pick,
         "bucket_markets": bucket_markets,
+        "candidates": candidates,
+        "confidence": confidence,
     }
