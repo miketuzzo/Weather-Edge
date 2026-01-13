@@ -192,6 +192,78 @@ section[data-testid="stSidebar"] {
 .we-red { color: var(--red); }
 .we-amber { color: var(--amber); }
 .we-cyan { color: var(--cyan); }
+
+/* Subtle motion + confidence ramp */
+@keyframes weGlowPulse {
+  0% { box-shadow: 0 0 0 rgba(34,211,238,0.0), 0 0 0 rgba(167,139,250,0.0); }
+  50% { box-shadow: 0 0 18px rgba(34,211,238,0.14), 0 0 22px rgba(167,139,250,0.12); }
+  100% { box-shadow: 0 0 0 rgba(34,211,238,0.0), 0 0 0 rgba(167,139,250,0.0); }
+}
+
+@keyframes weShimmer {
+  0% { transform: translateX(-40%); opacity: 0.0; }
+  20% { opacity: 0.35; }
+  50% { opacity: 0.15; }
+  100% { transform: translateX(140%); opacity: 0.0; }
+}
+
+.we-motion {
+  transition: transform 140ms ease, border-color 140ms ease, background 140ms ease;
+}
+.we-motion:hover {
+  transform: translateY(-2px);
+  border-color: rgba(34,211,238,0.35);
+}
+
+.we-pulse {
+  animation: weGlowPulse 4.2s ease-in-out infinite;
+}
+
+.we-ramp {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  border: 1px solid var(--stroke2);
+  background:
+    radial-gradient(420px 90px at 10% 20%, rgba(34,211,238,0.18), transparent 55%),
+    radial-gradient(420px 90px at 90% 20%, rgba(167,139,250,0.15), transparent 55%),
+    rgba(255,255,255,0.05);
+  overflow: hidden;
+}
+
+.we-ramp::after {
+  content: "";
+  position: absolute;
+  top: -40%;
+  left: -60%;
+  width: 55%;
+  height: 180%;
+  background: linear-gradient(90deg, transparent 0%, rgba(255,255,255,0.10) 50%, transparent 100%);
+  transform: translateX(-40%);
+  animation: weShimmer 6s ease-in-out infinite;
+  pointer-events: none;
+}
+
+.we-ramp-label { font-size: 12px; opacity: 0.75; }
+.we-ramp-val { font-size: 14px; font-weight: 800; }
+.we-ramp-track {
+  width: 140px;
+  height: 10px;
+  border-radius: 999px;
+  background: rgba(255,255,255,0.08);
+  border: 1px solid rgba(255,255,255,0.10);
+  overflow: hidden;
+}
+.we-ramp-fill {
+  height: 100%;
+  width: var(--pct);
+  border-radius: 999px;
+  background: linear-gradient(90deg, rgba(34,211,238,0.55), rgba(167,139,250,0.55), rgba(251,113,133,0.35));
+  transition: width 600ms ease;
+}
 </style>
 """
 
@@ -199,10 +271,10 @@ def _ui_inject_neon():
     st.markdown(NEON_CSS, unsafe_allow_html=True)
 
 def chip(html_text: str) -> str:
-    return f"<span class='we-chip'>{html_text}</span>"
+    return f"<span class='we-chip we-motion'>{html_text}</span>"
 
 def panel(title: str, inner_html: str) -> str:
-    return f"<div class='we-panel'><div class='we-panel-title'>{title}</div>{inner_html}</div>"
+    return f"<div class='we-panel we-motion'><div class='we-panel-title'>{title}</div>{inner_html}</div>"
 
 def kpi(label: str, value: str, sub: str = "") -> str:
     return (
@@ -392,6 +464,7 @@ def value_color(v):
     if v is None or (isinstance(v, float) and pd.isna(v)):
         return ""
     return "color: #22c55e;" if v > 0 else "color: #ef4444;"
+
 # -----------------------
 # Lock times (global): 9:30 CST and 12:00 CST
 # -----------------------
@@ -414,6 +487,40 @@ def is_after_lock_cst():
 def is_after_lock2_cst():
     n = now_cst()
     return (n.hour, n.minute) >= (LOCK2_HOUR, LOCK2_MIN)
+
+
+# -----------------------
+# UI-only: Confidence ramp (early → mid → late)
+# -----------------------
+
+def confidence_ramp_pct(now_dt: Optional[datetime] = None) -> float:
+    """0..100 ramp based on time of day relative to lock windows.
+    UI-only heuristic: not a model change.
+    """
+    try:
+        n = now_dt or now_cst()
+        # Define a smooth ramp from 07:00 → 17:00 CST
+        start = n.replace(hour=7, minute=0, second=0, microsecond=0)
+        end = n.replace(hour=17, minute=0, second=0, microsecond=0)
+        if n <= start:
+            return 12.0
+        if n >= end:
+            return 100.0
+        span = (end - start).total_seconds()
+        t = (n - start).total_seconds() / span
+        # ease-in-out curve
+        eased = (1 - (1 - t) * (1 - t)) if t < 0.5 else (t * t * (3 - 2 * t))
+        return max(0.0, min(100.0, 12.0 + 88.0 * eased))
+    except Exception:
+        return 50.0
+
+
+def ramp_stage(pct: float) -> str:
+    if pct >= 85:
+        return "Late"
+    if pct >= 45:
+        return "Mid"
+    return "Early"
 
 
 def render_overall_best_bet(snapshot_tables: dict):
@@ -597,8 +704,14 @@ def get_city_sigma(city_name: str) -> float:
 # -----------------------
 # Neon Terminal — Header + Control Room (UI-only)
 # -----------------------
+
 now_txt = now_cst().strftime('%a %b %-d, %Y · %-I:%M %p CST')
 strategy_live = "lock_1200" if is_after_lock2_cst() else "lock_0930"
+
+# Compute ramp variables for UI badge
+ramp_pct = confidence_ramp_pct()
+ramp_lbl = ramp_stage(ramp_pct)
+ramp_pct_str = f"{ramp_pct:.0f}%"
 
 st.markdown(
     f"""
@@ -610,6 +723,11 @@ st.markdown(
       {chip('🕒 Now: <b>' + now_txt + '</b>')}
       {chip('🧭 Live strategy: <b>' + strategy_live + '</b>')}
       {chip('🧾 Settlement: <b>NOAA/NWS observed highs</b>')}
+      <span class="we-ramp we-motion" style="--pct:{ramp_pct_str};">
+        <span class="we-ramp-label">📶 Confidence ramp</span>
+        <span class="we-ramp-val">{ramp_lbl} · {ramp_pct_str}</span>
+        <span class="we-ramp-track"><span class="we-ramp-fill"></span></span>
+      </span>
     </div>
   </div>
   <div style="text-align:right;opacity:0.85;">
@@ -1010,11 +1128,13 @@ try:
 except Exception:
     pass
 
+# UI-only: subtle pulse around the best-bet area
 best_bet_slot = st.container()
-
+st.markdown("<div class='we-pulse'>", unsafe_allow_html=True)
 snapshot_tables = {city: snapshots[city][0] for city in snapshots}
 with best_bet_slot:
     render_overall_best_bet(snapshot_tables)
+st.markdown("</div>", unsafe_allow_html=True)
 
 # UI-only: Top 3 opportunities
 try:
