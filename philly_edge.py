@@ -1,3 +1,48 @@
+from typing import Optional
+import math
+
+
+def compute_confidence(candidates: list, p_min: float, ev_min: float) -> Optional[float]:
+    """Compute a 0..1 confidence score for the top candidate (non-gating).
+    Uses (a) separation vs #2, (b) margin above p_min, (c) margin above ev_min.
+    Returns None if insufficient info.
+    """
+    try:
+        if not candidates or len(candidates) < 1:
+            return None
+        top = candidates[0] or {}
+        second = candidates[1] if len(candidates) > 1 else {}
+
+        top_blend = top.get("blend_p")
+        sec_blend = second.get("blend_p")
+
+        # Fallback to model_p if blend missing
+        if top_blend is None:
+            top_blend = top.get("model_p")
+        if sec_blend is None:
+            sec_blend = second.get("model_p")
+
+        if top_blend is None:
+            return None
+
+        gap = 0.0 if sec_blend is None else float(top_blend) - float(sec_blend)
+
+        # Use blend/model as the probability signal; use value_p for EV margin
+        p_signal = float(top_blend)
+        margin_p = p_signal - float(p_min)
+
+        v = top.get("value_p")
+        margin_ev = 0.0 if v is None else float(v) - float(ev_min)
+
+        # Weighted linear score -> squashed to 0..1 with logistic
+        z = (6.0 * gap) + (4.0 * margin_p) + (8.0 * margin_ev) - 0.5
+        conf = 1.0 / (1.0 + math.exp(-z))
+        # clamp
+        conf = max(0.0, min(1.0, float(conf)))
+        return conf
+    except Exception:
+        return None
+
 import os, time, math, base64
 from datetime import datetime, timedelta, timezone
 try:
@@ -109,31 +154,8 @@ SIGMA_F_1200_FACTOR = 0.90
 
 # Decision gates (accuracy-first, but avoid low-probability flyers)
 DEFAULT_P_MIN = 0.18      # minimum model probability to consider a contract
-DEFAULT_EV_MIN = -0.01    # allow slightly negative EV for accuracy-first; set to 0.0 for strict +EV
+DEFAULT_EV_MIN = -0.05    # allow slightly negative EV for accuracy-first; set to 0.0 for strict +EV
 DEFAULT_USE_MID_FOR_EV = True
-
-# City + lock-specific gating (tunable). Keys: city name used in app, strategy.
-# Defaults apply if no exact match.
-GATE_DEFAULTS = {
-    "p_min": DEFAULT_P_MIN,
-    "ev_min": DEFAULT_EV_MIN,
-}
-
-# Example overrides (start conservative; tune after candidates logging accumulates)
-GATE_OVERRIDES = {
-    # "Denver": {"lock_0930": {"ev_min": -0.03}, "lock_1200": {"ev_min": -0.06}},
-    # "Los Angeles": {"lock_0930": {"ev_min": -0.03}},
-}
-
-def gate_params(city: str, strategy: str):
-    c = (city or "").strip()
-    s = _norm_strategy(strategy)
-    p = dict(GATE_DEFAULTS)
-    ov = (GATE_OVERRIDES.get(c) or {}).get(s)
-    if isinstance(ov, dict):
-        p.update({k: ov[k] for k in ov if k in p})
-    return p["p_min"], p["ev_min"]
-
 
 def _norm_strategy(strategy: str) -> str:
     s = (strategy or "").strip().lower()
@@ -424,50 +446,6 @@ def blended_prob(p_model: float, p_market: float, alpha: float = 0.85) -> float:
     return (a * float(p_model)) + ((1.0 - a) * float(p_market))
 
 
-
-
-def is_bad_market_day(bucket_markets: list, max_missing_mid_frac: float = 0.45, max_wide_spread_frac: float = 0.45, spread_thresh: float = 0.25) -> bool:
-    """Heuristic: return True when market data is too sparse/noisy.
-
-    - missing_mid_frac: fraction of buckets missing YES mid and YES ask
-    - wide_spread_frac: fraction of buckets with (yes_ask - yes_bid) >= spread_thresh
-
-    These conditions correlate with bad decision quality; we prefer 'no bet'.
-    """
-    if not bucket_markets:
-        return True
-
-    missing = 0
-    wide = 0
-    total = 0
-
-    for bm in bucket_markets:
-        m = bm.get("market") or {}
-        total += 1
-
-        mid = best_yes_mid(m)
-        ya = yes_ask_prob(m)
-        yb = yes_bid_prob(m)
-
-        if (mid is None) and (ya is None):
-            missing += 1
-
-        if (ya is not None) and (yb is not None):
-            if float(ya) - float(yb) >= float(spread_thresh):
-                wide += 1
-
-    if total <= 0:
-        return True
-
-    missing_frac = missing / float(total)
-    wide_frac = wide / float(total)
-
-    if missing_frac >= float(max_missing_mid_frac):
-        return True
-    if wide_frac >= float(max_wide_spread_frac):
-        return True
-    return False
-
 def pick_best_bucket(
     bucket_markets: list,
     probs: dict,
@@ -536,43 +514,6 @@ def pick_best_bucket(
 
     return best
 
-
-
-
-def top_candidates(bucket_markets: list, probs: dict, alpha: float = 0.80, use_mid_for_ev: bool = DEFAULT_USE_MID_FOR_EV, top_n: int = 6):
-    """Return top-N candidate buckets with key fields for offline tuning."""
-    cands = []
-    for bm in bucket_markets:
-        label = bm.get("label")
-        m = bm.get("market") or {}
-        if not label:
-            continue
-        p_model = float(probs.get(label, 0.0))
-        ya = yes_ask_prob(m)
-        mid = best_yes_mid(m)
-        p_mkt = market_mid_prob(m)
-        price = None
-        if use_mid_for_ev and (mid is not None):
-            price = float(mid)
-        elif ya is not None:
-            price = float(ya)
-        value_p = None if price is None else (p_model - price)
-        blend_p = None if p_mkt is None else blended_prob(p_model, p_mkt, alpha=float(alpha))
-        cands.append({
-            "label": label,
-            "model_p": p_model,
-            "yes_ask": ya,
-            "market_mid": mid,
-            "market_p": p_mkt,
-            "value_p": value_p,
-            "blend_p": blend_p,
-        })
-    # Sort by blend_p then model_p; if blend missing, put last
-    def key(c):
-        bp = c.get("blend_p")
-        return (-1e9 if bp is None else bp, c.get("model_p", -1e9))
-    cands.sort(key=key, reverse=True)
-    return cands[:max(1, int(top_n))]
 
 def pick_best_bucket_gated(
     bucket_markets: list,
@@ -970,7 +911,7 @@ def _nws_hourly_means_for_local_day(target_day_local: datetime) -> list:
             means.append(float(pp["temperature"]))
     return means
 
-def log_forecast_snapshot(strategy: str = "lock_0930"):
+def log_forecast_snapshot():
     """
     Logs today's forecast snapshot (hourly means) + predicted expected max.
     Run this once in the morning (or each run—duplicates are deduped by date).
@@ -985,7 +926,7 @@ def log_forecast_snapshot(strategy: str = "lock_0930"):
             for line in f:
                 try:
                     obj = json.loads(line)
-                    if (obj.get("date") == date_s) and (obj.get("strategy", "lock_0930") == _norm_strategy(strategy)):
+                    if obj.get("date") == date_s:
                         return
                 except Exception:
                     continue
@@ -1004,7 +945,6 @@ def log_forecast_snapshot(strategy: str = "lock_0930"):
         "series": SERIES_TICKER,
         "expected_max": expected_max,
         "hourly_means": means,
-        "strategy": _norm_strategy(strategy),
     }
     with FORECAST_LOG.open("a", encoding="utf-8") as f:
         f.write(json.dumps(rec) + "\n")
@@ -1311,8 +1251,6 @@ def update_bias_from_completed_days(strategy: str = "lock_0930", span: int = 20,
                     continue
                 if rec.get("station") != STATION:
                     continue
-                if _norm_strategy(rec.get("strategy", "lock_0930")) != strat:
-                    continue
                 if not rec.get("date"):
                     continue
                 recs.append(rec)
@@ -1434,7 +1372,7 @@ def _ensure_perf_header():
     if PERF_CSV.exists():
         return
     PERF_CSV.write_text(
-        "date,city,station,sigma_f,labels_json,best_contract,yes_ask_prob,model_prob,value_prob,candidates_json,"
+        "date,city,station,sigma_f,labels_json,best_contract,yes_ask_prob,model_prob,value_prob,confidence,"
         "observed_high_f,winning_contract,won,profit,computed_winning,computed_won,strategy\n",
         encoding="utf-8"
     )
@@ -1449,7 +1387,7 @@ def perf_log_snapshot(
     yes_ask_prob: Optional[float],
     model_prob: Optional[float],
     value_prob: Optional[float],
-    candidates_json: Optional[str] = None,
+    confidence: Optional[float] = None,
     strategy: str = "lock_0930",
 ):
     """Append ONE row per city per day per strategy (deduped by date+city+strategy).
@@ -1473,7 +1411,7 @@ def perf_log_snapshot(
 
     columns = [
         "date","city","station","sigma_f","labels_json","best_contract",
-        "yes_ask_prob","model_prob","value_prob","candidates_json",
+        "yes_ask_prob","model_prob","value_prob","confidence",
         "observed_high_f","winning_contract","won","profit",
         "computed_winning","computed_won",
         "strategy",
@@ -1500,7 +1438,7 @@ def perf_log_snapshot(
         "yes_ask_prob": "" if yes_ask_prob is None else f"{float(yes_ask_prob):.6f}",
         "model_prob": "" if model_prob is None else f"{float(model_prob):.6f}",
         "value_prob": "" if value_prob is None else f"{float(value_prob):.6f}",
-        "candidates_json": ("" if candidates_json is None else str(candidates_json)),
+        "confidence": "" if confidence is None else f"{float(confidence):.6f}",
         "observed_high_f": "",
         "winning_contract": "",
         "won": "",
@@ -1629,7 +1567,7 @@ def perf_repair_csv_in_place() -> int:
     # Desired schema (stable)
     fieldnames = [
         "date","city","station","sigma_f","labels_json","best_contract",
-        "yes_ask_prob","model_prob","value_prob","candidates_json",
+        "yes_ask_prob","model_prob","value_prob","confidence",
         "observed_high_f","winning_contract","won","profit",
         "computed_winning","computed_won",
         "strategy",
@@ -2116,12 +2054,11 @@ def nws_hourly_forecast_next_hours(hours: int = 24):
     return out
 
 
-def compute_pick_for_today(
-    city: str = "",
+def compute_pick_for_today(city: str = None, 
     strategy: str = "lock_0930",
     alpha: float = 0.80,
-    p_min: float = None,
-    ev_min: float = None,
+    p_min: float = DEFAULT_P_MIN,
+    ev_min: float = DEFAULT_EV_MIN,
 ):
     """One-stop: compute probabilities (obs-conditioned + bias-corrected) and select a pick."""
     strat = _norm_strategy(strategy)
@@ -2135,16 +2072,6 @@ def compute_pick_for_today(
     sigma_f = sigma_for_strategy(strat)
 
     bucket_markets = get_today_bucket_markets()
-
-    # Bad market day: sparse/noisy quotes -> prefer no-bet
-    market_bad = is_bad_market_day(bucket_markets)
-
-    # Resolve gates (allow explicit overrides via args)
-    gp_min, gp_ev_min = gate_params(city, strat)
-    if p_min is None:
-        p_min = gp_min
-    if ev_min is None:
-        ev_min = gp_ev_min
     bucket_bounds = [(bm["label"], bm["lo"], bm["hi"]) for bm in bucket_markets]
 
     probs = model_probs_for_buckets(bucket_bounds, sigma_f=float(sigma_f), bias_f=float(bias_f))
@@ -2154,15 +2081,13 @@ def compute_pick_for_today(
     except Exception:
         high_so_far = float("nan")
 
-    pick = None
-    if not market_bad:
-        pick = pick_best_bucket_gated(
-            bucket_markets,
-            probs,
-            alpha=float(alpha),
-            p_min=float(p_min),
-            ev_min=float(ev_min),
-        )
+    pick = pick_best_bucket_gated(
+        bucket_markets,
+        probs,
+        alpha=float(alpha),
+        p_min=float(p_min),
+        ev_min=float(ev_min),
+    )
 
     return {
         "strategy": strat,

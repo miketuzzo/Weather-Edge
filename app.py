@@ -502,28 +502,30 @@ def compute_city_snapshot(city_name: str, strategy: str = "lock_0930", fast: boo
     sigma_base = 2.0 if fast else get_city_sigma(city_name)
     sigma = pe.sigma_for_strategy(strategy, base_sigma_f=sigma_base) if hasattr(pe, "sigma_for_strategy") else sigma_base
 
+    result = None  # engine output (candidates/confidence/market_bad)
+
     # Fetch markets (can fail if env vars missing / API issues)
     try:
         bucket_markets = pe.get_today_bucket_markets()
     except Exception as e:
         empty = pd.DataFrame(columns=["Contract", "YES ask %", "Odds", "Volume", "Value %", "Forecast win %"])
-        return empty, None, sigma, [], str(e)
+        return empty, None, sigma, [], str(e), None
 
     if not bucket_markets:
         empty = pd.DataFrame(columns=["Contract", "YES ask %", "Odds", "Volume", "Value %", "Forecast win %"])
-        return empty, None, sigma, [], "No market data"
+        return empty, None, sigma, [], "No market data", None
 
     labels = [bm["label"] for bm in bucket_markets]
     bucket_bounds = [(bm["label"], bm["lo"], bm["hi"]) for bm in bucket_markets]
 
     # Model probabilities (best effort but should usually work)
     try:
-        result = pe.compute_pick_for_today(city=city_name, strategy=strategy)  # UPDATED
+        result = pe.compute_pick_for_today(strategy=strategy)  # UPDATED
         probs = result['probs']
         # old: pe.model_probs_for_buckets(bucket_bounds, sigma)
     except Exception as e:
         empty = pd.DataFrame(columns=["Contract", "YES ask %", "Odds", "Volume", "Value %", "Forecast win %"])
-        return empty, None, sigma, labels, str(e)
+        return empty, None, sigma, labels, str(e), None
 
     rows = []
     for bm in bucket_markets:
@@ -600,29 +602,7 @@ def compute_city_snapshot(city_name: str, strategy: str = "lock_0930", fast: boo
             best = cand.sort_values("Value %", ascending=False).iloc[0].to_dict()
             best["Acc score %"] = None
 
-    # Override UI/leaderboard 'best' with engine pick (gated + EV-aware), when available
-    try:
-        engine_pick = result.get("pick") if isinstance(result, dict) else None
-        market_bad = bool(result.get("market_bad", False)) if isinstance(result, dict) else False
-        if market_bad or (engine_pick is None):
-            best = None
-        else:
-            label = engine_pick.get("label")
-            sub = df[df["Contract"].astype(str) == str(label)]
-            if len(sub):
-                best = sub.iloc[0].to_dict()
-                bp = engine_pick.get("blend_p")
-                if bp is not None:
-                    try:
-                        best["Acc score %"] = float(bp) * 100.0
-                    except Exception:
-                        pass
-            else:
-                best = {"Contract": label, "Acc score %": None}
-    except Exception:
-        pass
-
-    return df, best, sigma, labels, ""
+    return df, best, sigma, labels, "", result
 
 # -----------------------
 # Build leaderboard + logging
@@ -658,7 +638,7 @@ logged_any_0930 = False
 logged_any_1200 = False
 
 for city_name in CITIES.keys():
-    df, best, sigma, labels, err = compute_city_snapshot(city_name, strategy=DISPLAY_STRATEGY, fast=True)
+    df, best, sigma, labels, err, result = compute_city_snapshot(city_name, strategy=DISPLAY_STRATEGY, fast=True)
     snapshots[city_name] = (df, sigma, labels, err)
 
     # Append snapshot row for each city if possible
@@ -697,59 +677,45 @@ for city_name in CITIES.keys():
 
     # Log official (graded) picks at lock times once per day (9:30 CST and 12:00 CST)
     if DO_LOCK_0930 and hasattr(pe, "perf_log_snapshot"):
-        cfg_l = CITIES[city_name]
-        apply_city(cfg_l)
-        try:
-            r_lock = pe.compute_pick_for_today(city=city_name, strategy="lock_0930")
-            pick_l = r_lock.get("pick") if isinstance(r_lock, dict) else None
-            if (pick_l is None) or bool(r_lock.get("market_bad", False)):
-                # no-bet: do not log a contract; do not burn the lock
-                pass
-            else:
+        df_l, best_l, sigma_l, labels_l, err_l = compute_city_snapshot(city_name, strategy="lock_0930", fast=True)
+        if best_l is not None:
+            try:
                 pe.perf_log_snapshot(
                     date_s=pe._today_local_date_str(),
                     city=city_name,
                     station=CITIES[city_name]["station_obs"],
-                    sigma_f=float(r_lock.get("sigma_f", 0.0) or 0.0),
-                    labels=[bm.get("label") for bm in (r_lock.get("bucket_markets") or [])] or list((r_lock.get("probs") or {}).keys()),
-                    best_contract=pick_l.get("label"),
-                    yes_ask_prob=pick_l.get("yes_ask"),
-                    model_prob=pick_l.get("model_p"),
-                    value_prob=pick_l.get("value_p"),
-                    candidates_json=json.dumps(r_lock.get("candidates", []), ensure_ascii=False),
+                    sigma_f=sigma_l,
+                    labels=labels_l,
+                    best_contract=best_l.get("Contract"),
+                    yes_ask_prob=(best_l.get("YES ask %")/100.0 if best_l.get("YES ask %") is not None else None),
+                    model_prob=(best_l.get("Forecast win %")/100.0 if best_l.get("Forecast win %") is not None else None),
+                    value_prob=(best_l.get("Value %")/100.0 if best_l.get("Value %") is not None else None),
                     strategy="lock_0930",
                 )
                 logged_any_0930 = True
-        except Exception:
-            pass
+            except Exception:
+                pass
 
 
     if DO_LOCK_1200 and hasattr(pe, "perf_log_snapshot"):
-        cfg_l = CITIES[city_name]
-        apply_city(cfg_l)
-        try:
-            r_lock = pe.compute_pick_for_today(city=city_name, strategy="lock_1200")
-            pick_l = r_lock.get("pick") if isinstance(r_lock, dict) else None
-            if (pick_l is None) or bool(r_lock.get("market_bad", False)):
-                # no-bet: do not log a contract; do not burn the lock
-                pass
-            else:
+        df_l, best_l, sigma_l, labels_l, err_l = compute_city_snapshot(city_name, strategy="lock_1200", fast=True)
+        if best_l is not None:
+            try:
                 pe.perf_log_snapshot(
                     date_s=pe._today_local_date_str(),
                     city=city_name,
                     station=CITIES[city_name]["station_obs"],
-                    sigma_f=float(r_lock.get("sigma_f", 0.0) or 0.0),
-                    labels=[bm.get("label") for bm in (r_lock.get("bucket_markets") or [])] or list((r_lock.get("probs") or {}).keys()),
-                    best_contract=pick_l.get("label"),
-                    yes_ask_prob=pick_l.get("yes_ask"),
-                    model_prob=pick_l.get("model_p"),
-                    value_prob=pick_l.get("value_p"),
-                    candidates_json=json.dumps(r_lock.get("candidates", []), ensure_ascii=False),
+                    sigma_f=sigma_l,
+                    labels=labels_l,
+                    best_contract=best_l.get("Contract"),
+                    yes_ask_prob=(best_l.get("YES ask %")/100.0 if best_l.get("YES ask %") is not None else None),
+                    model_prob=(best_l.get("Forecast win %")/100.0 if best_l.get("Forecast win %") is not None else None),
+                    value_prob=(best_l.get("Value %")/100.0 if best_l.get("Value %") is not None else None),
                     strategy="lock_1200",
                 )
                 logged_any_1200 = True
-        except Exception:
-            pass
+            except Exception:
+                pass
 
 
     if best is None:
@@ -812,7 +778,7 @@ lb = lb.sort_values("_sort", ascending=False).drop(columns=["_sort"])
 
 # Live market status column (locked / not viable)
 def _status_for_city(city: str, best_contract: Optional[str]) -> str:
-    df0 = snapshots.get(city, (None, None, None, ""))[0]
+    df0 = snapshots.get(city, (None, None, None, "", None))[0]
     status_str, dom_contract, dom_yes, is_locked, is_not_viable = market_lock_info(df0, best_contract=best_contract)
     if is_not_viable and dom_contract is not None and dom_yes is not None:
         return f"⛔ Locked to {dom_contract} ({float(dom_yes):.1f}%)"
@@ -878,7 +844,7 @@ default_city = (
 )
 city_pick = st.selectbox("Select a city", lb["City"].tolist(), index=list(lb["City"]).index(default_city))
 
-df_city, best_city, sigma_city, _labels_city, err_city = compute_city_snapshot(city_pick, strategy=DISPLAY_STRATEGY, fast=False)
+df_city, best_city, sigma_city, _labels_city, err_city, _res_city = compute_city_snapshot(city_pick, strategy=DISPLAY_STRATEGY, fast=False)
 cfg = CITIES[city_pick]
 st.caption(f"Settlement station: {cfg['station_label']}")
 
