@@ -48,6 +48,7 @@ jobs:
           KALSHI_KEY_ID: ${{ secrets.KALSHI_KEY_ID }}
           KALSHI_PRIVATE_KEY: ${{ secrets.KALSHI_PRIVATE_KEY }}
         run: |
+          python -c "import os; print('KEY_ID_SET=', bool(os.getenv('KALSHI_KEY_ID'))); print('PEM_LEN=', len(os.getenv('KALSHI_PRIVATE_KEY_PEM','')))"
           python track.py
 
       - name: Commit updated performance data
