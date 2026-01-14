@@ -2,32 +2,70 @@ name: Weather Edge Tracker
 
 on:
   schedule:
-    - cron: "*/30 * * * *"
-  workflow_dispatch:
+    # 09:30 CST (15:30 UTC)
+    - cron: "30 15 * * *"
+    # 12:00 CST (18:00 UTC)
+    - cron: "0 18 * * *"
+    # Nightly settlement sweep (02:15 CST)
+    - cron: "15 8 * * *"
+  workflow_dispatch: {}
+
+# Prevent overlapping runs (important if a run is slow)
+concurrency:
+  group: weather-edge-tracker
+  cancel-in-progress: false
+
+permissions:
+  contents: write
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
         with:
-          python-version: "3.11"
+          fetch-depth: 0  # needed to safely rebase/push
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Ensure data dir exists
+        run: |
+          mkdir -p data
 
       - name: Run tracker
         env:
+          # Put these in GitHub repo Settings → Secrets and variables → Actions
           KALSHI_KEY_ID: ${{ secrets.KALSHI_KEY_ID }}
-          KALSHI_PRIVATE_KEY_PEM: ${{ secrets.KALSHI_PRIVATE_KEY_PEM }}
-        run: python track.py
+          KALSHI_PRIVATE_KEY: ${{ secrets.KALSHI_PRIVATE_KEY }}
+        run: |
+          python track.py
 
-      - name: Commit updated performance.csv
+      - name: Commit updated performance data
         run: |
           git config user.name "weather-edge-bot"
-          git config user.email "weather-edge-bot@users.noreply.github.com"
-          git add data/performance.csv
-          git commit -m "Update performance tracking" || echo "No changes"
-          git push
+          git config user.email "actions@users.noreply.github.com"
+
+          # Stage only the files we care about (safe even if missing)
+          git add data/performance.csv data/cron_track.log || true
+
+          # If nothing changed, exit cleanly
+          git diff --cached --quiet && echo "No changes to commit." && exit 0
+
+          # Commit
+          git commit -m "Auto update performance data"
+
+          # Rebase onto latest main to avoid push rejection
+          git pull --rebase origin main
+
+          # Push using the built-in token from checkout
+          git push origin main
