@@ -10,13 +10,15 @@ Goals:
     - KALSHI_PRIVATE_KEY_PEM (multiline)
     - KALSHI_PRIVATE_KEY_B64 (single-line base64)
     - KALSHI_PRIVATE_KEY_PATH (file path)
+
+Notes:
+- In GitHub Actions, secrets passed via env are strings; base64 is usually safest.
+- This script will decode B64 -> /tmp/kalshi.key and set KALSHI_PRIVATE_KEY_PATH for philly_edge.py
 """
 
 import os
 import sys
 import csv
-import json
-import time
 import base64
 import traceback
 from datetime import datetime, timezone
@@ -54,7 +56,6 @@ PERF_COLUMNS = [
     "strategy",
 ]
 
-
 # -------------------------
 # Logging helpers
 # -------------------------
@@ -66,7 +67,6 @@ def log(msg: str) -> None:
         with LOG_PATH.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
     except Exception:
-        # logging must never fail the run
         pass
 
 
@@ -93,34 +93,66 @@ def set_locked(strategy: str, day: str, detail: str = "") -> None:
 # -------------------------
 # Secrets handling
 # -------------------------
+def _clean_b64(s: str) -> str:
+    """Remove whitespace/newlines so base64 decoding works even if pasted with line breaks."""
+    return "".join((s or "").split())
+
+
+def _looks_like_pem(text: str) -> bool:
+    t = (text or "").strip()
+    return t.startswith("-----BEGIN") and "PRIVATE KEY" in t
+
+
+def has_kalshi_key_material() -> bool:
+    """Used to decide if settlement is safe to run."""
+    if os.getenv("KALSHI_PRIVATE_KEY_PATH", "").strip():
+        return True
+    if os.getenv("KALSHI_PRIVATE_KEY_PEM", "").strip():
+        return True
+    if os.getenv("KALSHI_PRIVATE_KEY_B64", "").strip():
+        return True
+    # Some people store PEM-as-base64 in KALSHI_PRIVATE_KEY_PEM by mistake
+    pem = os.getenv("KALSHI_PRIVATE_KEY_PEM", "")
+    if pem and _clean_b64(pem) and not _looks_like_pem(pem):
+        return True
+    return False
+
+
 def ensure_kalshi_key_material() -> None:
     """
     Ensures Kalshi key is available for philly_edge.py.
     Supports:
-      - KALSHI_PRIVATE_KEY_PEM
-      - KALSHI_PRIVATE_KEY_B64  (preferred in Actions)
-      - KALSHI_PRIVATE_KEY_PATH
+      - KALSHI_PRIVATE_KEY_PEM (raw multiline PEM)
+      - KALSHI_PRIVATE_KEY_B64 (base64 of PEM bytes)  <-- recommended in Actions
+      - KALSHI_PRIVATE_KEY_PATH (file path)
+    Also handles the common mistake: KALSHI_PRIVATE_KEY_PEM accidentally contains base64.
     """
-    key_id = os.getenv("KALSHI_KEY_ID", "").strip() or os.getenv("KALSHI_API_KEY_ID", "").strip()
-    pem = os.getenv("KALSHI_PRIVATE_KEY_PEM", "")
-    b64 = os.getenv("KALSHI_PRIVATE_KEY_B64", "").strip()
-    key_path = os.getenv("KALSHI_PRIVATE_KEY_PATH", "").strip() or os.getenv("KALSHI_API_PRIVATE_KEY_PATH", "").strip()
+    key_id = (os.getenv("KALSHI_KEY_ID") or os.getenv("KALSHI_API_KEY_ID") or "").strip()
+    pem = os.getenv("KALSHI_PRIVATE_KEY_PEM", "") or ""
+    b64 = os.getenv("KALSHI_PRIVATE_KEY_B64", "") or ""
+    key_path = (os.getenv("KALSHI_PRIVATE_KEY_PATH") or os.getenv("KALSHI_API_PRIVATE_KEY_PATH") or "").strip()
 
-    log(f"[ENV] KEY_ID_SET={bool(key_id)} PEM_LEN={len(pem.strip())} B64_LEN={len(b64)} PATH_SET={bool(key_path)}")
+    pem_stripped = pem.strip()
+    b64_clean = _clean_b64(b64)
+
+    log(
+        f"[ENV] KEY_ID_SET={bool(key_id)} "
+        f"PEM_LEN={len(pem_stripped)} B64_LEN={len(b64_clean)} PATH_SET={bool(key_path)}"
+    )
 
     # If path already provided, nothing to do
     if key_path:
         return
 
-    # If PEM is present, leave it to philly_edge (it reads *_PEM)
-    if pem.strip():
+    # If PEM looks valid, leave it to philly_edge (it reads *_PEM)
+    if pem_stripped and _looks_like_pem(pem_stripped):
         return
 
-    # If B64 is present, decode to a temp file and set *_PATH
-    if b64:
+    # If B64 exists, decode it into a file and set *_PATH
+    if b64_clean:
         tmp_key = Path("/tmp/kalshi.key")
         try:
-            raw = base64.b64decode(b64.encode("utf-8"))
+            raw = base64.b64decode(b64_clean.encode("utf-8"))
             tmp_key.write_bytes(raw)
             os.environ["KALSHI_PRIVATE_KEY_PATH"] = str(tmp_key)
             log(f"[ENV] Decoded KALSHI_PRIVATE_KEY_B64 -> {tmp_key} ({tmp_key.stat().st_size} bytes)")
@@ -128,25 +160,27 @@ def ensure_kalshi_key_material() -> None:
             log(f"[ENV][ERROR] Failed to decode KALSHI_PRIVATE_KEY_B64: {e}")
         return
 
-    # If none of the above exist, we just proceed; picks will log missing-key per city.
+    # Common mistake: PEM env var contains base64 instead of PEM text
+    pem_b64_clean = _clean_b64(pem_stripped)
+    if pem_b64_clean and not _looks_like_pem(pem_stripped):
+        tmp_key = Path("/tmp/kalshi.key")
+        try:
+            raw = base64.b64decode(pem_b64_clean.encode("utf-8"))
+            tmp_key.write_bytes(raw)
+            os.environ["KALSHI_PRIVATE_KEY_PATH"] = str(tmp_key)
+            # Clear the PEM var so philly_edge doesn't try to parse base64 as PEM
+            os.environ.pop("KALSHI_PRIVATE_KEY_PEM", None)
+            log(f"[ENV] Decoded (PEM-as-B64) -> {tmp_key} ({tmp_key.stat().st_size} bytes)")
+        except Exception as e:
+            log(f"[ENV][ERROR] Failed to decode KALSHI_PRIVATE_KEY_PEM as base64: {e}")
+        return
+
     log("[ENV][WARN] No Kalshi private key material found (PEM/B64/PATH). Market calls may fail.")
 
 
 # -------------------------
 # CSV helpers
 # -------------------------
-def read_existing_rows() -> list:
-    if not PERF_PATH.exists():
-        return []
-    try:
-        with PERF_PATH.open("r", encoding="utf-8", newline="") as f:
-            reader = csv.DictReader(f)
-            return list(reader)
-    except Exception as e:
-        log(f"[CSV][ERROR] Failed reading performance.csv: {e}")
-        return []
-
-
 def write_rows_append(new_rows: list) -> int:
     """
     Append rows to performance.csv, creating it with PERF_COLUMNS if missing.
@@ -155,14 +189,12 @@ def write_rows_append(new_rows: list) -> int:
     if not new_rows:
         return 0
 
-    # Normalize / filter rows
     cleaned = []
     for r in new_rows:
         if not isinstance(r, dict):
             continue
-        # remove None keys to avoid the exact crash you saw
+        # remove None keys to avoid csv.DictWriter crash
         r = {k: v for k, v in r.items() if k is not None}
-        # keep only known columns
         out = {c: r.get(c, "") for c in PERF_COLUMNS}
         cleaned.append(out)
 
@@ -189,7 +221,7 @@ def write_rows_append(new_rows: list) -> int:
 def run_lock(pe, strategy: str, day: str) -> int:
     """
     Run one lock strategy (lock_0930 or lock_1200).
-    Tries multiple function names to match your evolving philly_edge.py.
+    Tries multiple function names to match evolving philly_edge.py.
     Returns number of rows appended.
     """
     if is_locked(strategy, day):
@@ -198,8 +230,6 @@ def run_lock(pe, strategy: str, day: str) -> int:
 
     log(f"[TRACK] running {strategy} for {day}")
 
-    # Preferred: philly_edge provides a high-level tracking function
-    # We try in order of likely names; fall back to per-city compute.
     candidate_funcs = [
         "track_lock_for_day",
         "run_lock_for_day",
@@ -213,17 +243,15 @@ def run_lock(pe, strategy: str, day: str) -> int:
         fn = getattr(pe, fname, None)
         if callable(fn):
             try:
-                out = fn(day=day, strategy=strategy)  # might accept named args
+                out = fn(day=day, strategy=strategy)
                 if isinstance(out, list):
                     new_rows = out
                 elif isinstance(out, tuple) and out and isinstance(out[0], list):
                     new_rows = out[0]
                 else:
-                    # could be None; rows might already be written inside pe
                     new_rows = []
                 break
             except TypeError:
-                # try positional
                 try:
                     out = fn(day, strategy)
                     if isinstance(out, list):
@@ -240,10 +268,7 @@ def run_lock(pe, strategy: str, day: str) -> int:
 
     # Fallback: compute per-city if no high-level fn exists
     if not new_rows:
-        cities = getattr(pe, "CITIES", None)
-        if not cities:
-            # hard fallback
-            cities = ["Philadelphia", "Los Angeles", "Denver", "Miami", "NYC", "Chicago", "Austin"]
+        cities = getattr(pe, "CITIES", None) or ["Philadelphia", "Los Angeles", "Denver", "Miami", "NYC", "Chicago", "Austin"]
 
         compute_fn = getattr(pe, "compute_pick_for_today", None) or getattr(pe, "compute_pick", None)
         if not callable(compute_fn):
@@ -251,32 +276,24 @@ def run_lock(pe, strategy: str, day: str) -> int:
         else:
             for city in cities:
                 try:
-                    # Most compatible call shape
                     result = compute_fn(city=city, strategy=strategy)
-                    # We expect either:
-                    # - dict row
-                    # - tuple containing a dict row
                     row = None
                     if isinstance(result, dict):
                         row = result
                     elif isinstance(result, tuple):
-                        # pick first dict-like
                         for item in result:
                             if isinstance(item, dict):
                                 row = item
                                 break
                     if row:
-                        # ensure strategy/date
                         row.setdefault("strategy", strategy)
                         row.setdefault("date", day)
                         new_rows.append(row)
                 except Exception as e:
                     log(f"[TRACK][{strategy}][{city}] ERROR: {e}")
 
-    # Append rows ourselves (safe) if any
     wrote = write_rows_append(new_rows)
 
-    # Only create lock file if something meaningful happened
     if wrote > 0:
         set_locked(strategy, day, detail=f"wrote={wrote}")
         log(f"[TRACK] {strategy}: wrote {wrote} rows and set lock.")
@@ -289,7 +306,7 @@ def run_lock(pe, strategy: str, day: str) -> int:
 def run_settlement(pe) -> None:
     """
     Settlement sweep: update outcomes using NOAA/NWS observed highs.
-    We hard-wrap to ensure workflow never fails.
+    Hard-wrapped so workflow never fails.
     """
     fn = getattr(pe, "perf_update_outcomes", None) or getattr(pe, "update_outcomes", None)
     if not callable(fn):
@@ -302,10 +319,11 @@ def run_settlement(pe) -> None:
         log("[SETTLE] Settlement sweep complete.")
     except Exception as e:
         log(f"[SETTLE][ERROR] Settlement sweep failed (non-fatal): {e}")
+        log(traceback.format_exc())
 
 
 def main() -> int:
-    # Secrets / key material
+    # Ensure key material is wired for philly_edge
     ensure_kalshi_key_material()
 
     # Import engine
@@ -326,8 +344,12 @@ def main() -> int:
             log(f"[TRACK][{strat}][ERROR] Non-fatal: {e}")
             log(traceback.format_exc())
 
-    # Settlement sweep (always attempt; never fatal)
-    run_settlement(pe)
+    # IMPORTANT: only run settlement if we actually have key material.
+    # This avoids crashes inside pe.perf_update_outcomes() during "missing key" runs.
+    if has_kalshi_key_material():
+        run_settlement(pe)
+    else:
+        log("[SETTLE] Skipping settlement sweep (no Kalshi key material present).")
 
     log(f"[DONE] total_rows_written={total_written}")
     return 0  # Always succeed so schedule keeps running
