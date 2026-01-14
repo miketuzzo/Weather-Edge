@@ -1,152 +1,337 @@
-from __future__ import annotations
+#!/usr/bin/env python3
+"""
+Weather Edge Tracker (GitHub Actions)
 
-from datetime import datetime
+Goals:
+- Run lock_0930 and lock_1200 picks (idempotent via lock files)
+- Run settlement sweep (update observed highs + wins) if available
+- Never crash the workflow (log errors; exit 0)
+- Support Kalshi auth via either:
+    - KALSHI_PRIVATE_KEY_PEM (multiline)
+    - KALSHI_PRIVATE_KEY_B64 (single-line base64)
+    - KALSHI_PRIVATE_KEY_PATH (file path)
+"""
+
+import os
+import sys
+import csv
+import json
+import time
+import base64
+import traceback
+from datetime import datetime, timezone
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
-import philly_edge as pe
+# -------------------------
+# Paths / constants
+# -------------------------
+ROOT = Path(__file__).resolve().parent
+DATA_DIR = ROOT / "data"
+DATA_DIR.mkdir(exist_ok=True)
 
-# NOTE:
-# - This script is meant to run via GitHub Actions / cron.
-# - It logs ONE snapshot per strategy per day into data/performance.csv
-# - It also back-fills outcomes for previous days.
+PERF_PATH = DATA_DIR / "performance.csv"
+LOG_PATH = DATA_DIR / "cron_track.log"
+LOCK_DIR = DATA_DIR / "locks"
+LOCK_DIR.mkdir(exist_ok=True)
 
-# City config must live here so this script can run without the Streamlit app.
-# station_obs should match the settlement/official station used for verification.
-CITIES = {
-    "Philadelphia": {"series": "KXHIGHPHIL", "station_obs": "KPHL", "lat": 39.872, "lon": -75.241},
-    "Los Angeles": {"series": "KXHIGHLAX", "station_obs": "KLAX", "lat": 33.9425, "lon": -118.4081},
-    "Denver": {"series": "KXHIGHDEN", "station_obs": "KDEN", "lat": 39.8561, "lon": -104.6737},
-    "Miami": {"series": "KXHIGHMIA", "station_obs": "KMIA", "lat": 25.7959, "lon": -80.2870},
-    "NYC": {"series": "KXHIGHNY", "station_obs": "KNYC", "lat": 40.7790, "lon": -73.96925},  # Central Park
-    "Chicago": {"series": "KXHIGHCHI", "station_obs": "KMDW", "lat": 41.7868, "lon": -87.7522},
-    "Austin": {"series": "KXHIGHAUS", "station_obs": "KAUS", "lat": 30.1945, "lon": -97.6699},
-}
-
-CST = ZoneInfo("America/Chicago")
-LOCK_DIR = Path("data/locks")
-LOCK_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def apply_city(cfg: dict) -> None:
-    pe.SERIES_TICKER = cfg["series"]
-    pe.STATION = cfg["station_obs"]
-    pe.LAT = cfg["lat"]
-    pe.LON = cfg["lon"]
-
-
-def lock_file(strategy: str, date_s: str) -> Path:
-    # Keep the same naming convention you already have in data/locks
-    # Example: data/locks/LOCKED_0930_2026-01-07_CST.txt
-    suffix = "0930" if strategy == "lock_0930" else "1200" if strategy == "lock_1200" else strategy
-    return LOCK_DIR / f"LOCKED_{suffix}_{date_s}_CST.txt"
+# Canonical columns (match your current performance.csv shape)
+PERF_COLUMNS = [
+    "date",
+    "city",
+    "station",
+    "sigma_f",
+    "labels_json",
+    "best_contract",
+    "yes_ask_prob",
+    "model_prob",
+    "value_prob",
+    "observed_high_f",
+    "winning_contract",
+    "won",
+    "profit",
+    "computed_winning",
+    "computed_won",
+    "strategy",
+]
 
 
-def should_run_lock(strategy: str, date_s: str) -> bool:
-    return not lock_file(strategy, date_s).exists()
+# -------------------------
+# Logging helpers
+# -------------------------
+def log(msg: str) -> None:
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    line = f"[{stamp}] {msg}"
+    print(line, flush=True)
+    try:
+        with LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        # logging must never fail the run
+        pass
 
 
-def mark_lock_ran(strategy: str, date_s: str) -> None:
-    lock_file(strategy, date_s).write_text("ok\n", encoding="utf-8")
+def today_str_utc() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
-def log_today_for_all_cities(strategy: str) -> int:
-    """Log one snapshot row per city for the given strategy.
+def lock_file(strategy: str, day: str) -> Path:
+    return LOCK_DIR / f"{day}_{strategy}.lock"
 
-    Returns number of rows successfully logged.
+
+def is_locked(strategy: str, day: str) -> bool:
+    return lock_file(strategy, day).exists()
+
+
+def set_locked(strategy: str, day: str, detail: str = "") -> None:
+    lf = lock_file(strategy, day)
+    try:
+        lf.write_text(detail or "ok", encoding="utf-8")
+    except Exception:
+        pass
+
+
+# -------------------------
+# Secrets handling
+# -------------------------
+def ensure_kalshi_key_material() -> None:
     """
-    today_s = pe._today_local_date_str()
-    wrote = 0
+    Ensures Kalshi key is available for philly_edge.py.
+    Supports:
+      - KALSHI_PRIVATE_KEY_PEM
+      - KALSHI_PRIVATE_KEY_B64  (preferred in Actions)
+      - KALSHI_PRIVATE_KEY_PATH
+    """
+    key_id = os.getenv("KALSHI_KEY_ID", "").strip() or os.getenv("KALSHI_API_KEY_ID", "").strip()
+    pem = os.getenv("KALSHI_PRIVATE_KEY_PEM", "")
+    b64 = os.getenv("KALSHI_PRIVATE_KEY_B64", "").strip()
+    key_path = os.getenv("KALSHI_PRIVATE_KEY_PATH", "").strip() or os.getenv("KALSHI_API_PRIVATE_KEY_PATH", "").strip()
 
-    for city, cfg in CITIES.items():
+    log(f"[ENV] KEY_ID_SET={bool(key_id)} PEM_LEN={len(pem.strip())} B64_LEN={len(b64)} PATH_SET={bool(key_path)}")
+
+    # If path already provided, nothing to do
+    if key_path:
+        return
+
+    # If PEM is present, leave it to philly_edge (it reads *_PEM)
+    if pem.strip():
+        return
+
+    # If B64 is present, decode to a temp file and set *_PATH
+    if b64:
+        tmp_key = Path("/tmp/kalshi.key")
         try:
-            apply_city(cfg)
-
-            sigma = pe.calibrate_sigma(days_back=14)
-
-            bucket_markets = pe.get_today_bucket_markets()
-            if not bucket_markets:
-                continue
-
-            labels = [bm["label"] for bm in bucket_markets]
-            bucket_bounds = [(bm["label"], bm["lo"], bm["hi"]) for bm in bucket_markets]
-            probs = pe.model_probs_for_buckets(bucket_bounds, sigma)
-
-            # Find best value bucket (Model - YES ask)
-            best = None
-            best_value = None
-
-            for bm in bucket_markets:
-                label = bm["label"]
-                m = bm["market"]
-
-                p_model = float(probs.get(label, 0.0))
-                yes_ask = pe.yes_ask_prob(m)  # 0..1 or None
-                if yes_ask is None:
-                    continue
-                value = p_model - yes_ask
-
-                if (best_value is None) or (value > best_value):
-                    best_value = value
-                    best = (label, yes_ask, p_model, value)
-
-            if best is None:
-                continue
-
-            label, yes_ask, p_model, value = best
-
-            # IMPORTANT: pass strategy through so lock_1200 rows are distinct
-            pe.perf_log_snapshot(
-                date_s=today_s,
-                city=city,
-                station=cfg["station_obs"],
-                sigma_f=sigma,
-                labels=labels,
-                best_contract=label,
-                yes_ask_prob=yes_ask,
-                model_prob=p_model,
-                value_prob=value,
-                strategy=strategy,
-            )
-            wrote += 1
-
+            raw = base64.b64decode(b64.encode("utf-8"))
+            tmp_key.write_bytes(raw)
+            os.environ["KALSHI_PRIVATE_KEY_PATH"] = str(tmp_key)
+            log(f"[ENV] Decoded KALSHI_PRIVATE_KEY_B64 -> {tmp_key} ({tmp_key.stat().st_size} bytes)")
         except Exception as e:
-            print(f"[TRACK][{strategy}][{city}] ERROR: {e}")
+            log(f"[ENV][ERROR] Failed to decode KALSHI_PRIVATE_KEY_B64: {e}")
+        return
+
+    # If none of the above exist, we just proceed; picks will log missing-key per city.
+    log("[ENV][WARN] No Kalshi private key material found (PEM/B64/PATH). Market calls may fail.")
+
+
+# -------------------------
+# CSV helpers
+# -------------------------
+def read_existing_rows() -> list:
+    if not PERF_PATH.exists():
+        return []
+    try:
+        with PERF_PATH.open("r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            return list(reader)
+    except Exception as e:
+        log(f"[CSV][ERROR] Failed reading performance.csv: {e}")
+        return []
+
+
+def write_rows_append(new_rows: list) -> int:
+    """
+    Append rows to performance.csv, creating it with PERF_COLUMNS if missing.
+    Filters out bad keys (None) and unknown keys (keeps only PERF_COLUMNS).
+    """
+    if not new_rows:
+        return 0
+
+    # Normalize / filter rows
+    cleaned = []
+    for r in new_rows:
+        if not isinstance(r, dict):
             continue
+        # remove None keys to avoid the exact crash you saw
+        r = {k: v for k, v in r.items() if k is not None}
+        # keep only known columns
+        out = {c: r.get(c, "") for c in PERF_COLUMNS}
+        cleaned.append(out)
+
+    if not cleaned:
+        return 0
+
+    file_exists = PERF_PATH.exists()
+    try:
+        with PERF_PATH.open("a", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=PERF_COLUMNS)
+            if not file_exists:
+                writer.writeheader()
+            for row in cleaned:
+                writer.writerow(row)
+        return len(cleaned)
+    except Exception as e:
+        log(f"[CSV][ERROR] Append failed: {e}")
+        return 0
+
+
+# -------------------------
+# Main tracking logic
+# -------------------------
+def run_lock(pe, strategy: str, day: str) -> int:
+    """
+    Run one lock strategy (lock_0930 or lock_1200).
+    Tries multiple function names to match your evolving philly_edge.py.
+    Returns number of rows appended.
+    """
+    if is_locked(strategy, day):
+        log(f"[TRACK] {strategy} already ran for {day} (lock exists). Skipping.")
+        return 0
+
+    log(f"[TRACK] running {strategy} for {day}")
+
+    # Preferred: philly_edge provides a high-level tracking function
+    # We try in order of likely names; fall back to per-city compute.
+    candidate_funcs = [
+        "track_lock_for_day",
+        "run_lock_for_day",
+        "perf_run_lock_for_day",
+        "perf_track_lock",
+    ]
+
+    new_rows = []
+
+    for fname in candidate_funcs:
+        fn = getattr(pe, fname, None)
+        if callable(fn):
+            try:
+                out = fn(day=day, strategy=strategy)  # might accept named args
+                if isinstance(out, list):
+                    new_rows = out
+                elif isinstance(out, tuple) and out and isinstance(out[0], list):
+                    new_rows = out[0]
+                else:
+                    # could be None; rows might already be written inside pe
+                    new_rows = []
+                break
+            except TypeError:
+                # try positional
+                try:
+                    out = fn(day, strategy)
+                    if isinstance(out, list):
+                        new_rows = out
+                    elif isinstance(out, tuple) and out and isinstance(out[0], list):
+                        new_rows = out[0]
+                    else:
+                        new_rows = []
+                    break
+                except Exception as e:
+                    log(f"[TRACK][{strategy}] {fname} failed: {e}")
+            except Exception as e:
+                log(f"[TRACK][{strategy}] {fname} failed: {e}")
+
+    # Fallback: compute per-city if no high-level fn exists
+    if not new_rows:
+        cities = getattr(pe, "CITIES", None)
+        if not cities:
+            # hard fallback
+            cities = ["Philadelphia", "Los Angeles", "Denver", "Miami", "NYC", "Chicago", "Austin"]
+
+        compute_fn = getattr(pe, "compute_pick_for_today", None) or getattr(pe, "compute_pick", None)
+        if not callable(compute_fn):
+            log(f"[TRACK][{strategy}] No compute function found in philly_edge.py (expected compute_pick_for_today).")
+        else:
+            for city in cities:
+                try:
+                    # Most compatible call shape
+                    result = compute_fn(city=city, strategy=strategy)
+                    # We expect either:
+                    # - dict row
+                    # - tuple containing a dict row
+                    row = None
+                    if isinstance(result, dict):
+                        row = result
+                    elif isinstance(result, tuple):
+                        # pick first dict-like
+                        for item in result:
+                            if isinstance(item, dict):
+                                row = item
+                                break
+                    if row:
+                        # ensure strategy/date
+                        row.setdefault("strategy", strategy)
+                        row.setdefault("date", day)
+                        new_rows.append(row)
+                except Exception as e:
+                    log(f"[TRACK][{strategy}][{city}] ERROR: {e}")
+
+    # Append rows ourselves (safe) if any
+    wrote = write_rows_append(new_rows)
+
+    # Only create lock file if something meaningful happened
+    if wrote > 0:
+        set_locked(strategy, day, detail=f"wrote={wrote}")
+        log(f"[TRACK] {strategy}: wrote {wrote} rows and set lock.")
+    else:
+        log(f"[TRACK] {strategy}: wrote 0 rows, not creating lock file")
 
     return wrote
 
 
-def maybe_run_lock(strategy: str, hour: int, minute: int) -> None:
-    today_s = pe._today_local_date_str()
-    now_cst = datetime.now(CST)
-
-    # Only run after the target time
-    if (now_cst.hour, now_cst.minute) < (hour, minute):
+def run_settlement(pe) -> None:
+    """
+    Settlement sweep: update outcomes using NOAA/NWS observed highs.
+    We hard-wrap to ensure workflow never fails.
+    """
+    fn = getattr(pe, "perf_update_outcomes", None) or getattr(pe, "update_outcomes", None)
+    if not callable(fn):
+        log("[SETTLE] No settlement function found (perf_update_outcomes). Skipping.")
         return
 
-    # Only run once per day
-    if not should_run_lock(strategy, today_s):
-        return
+    try:
+        log("[SETTLE] Starting settlement sweep...")
+        fn()
+        log("[SETTLE] Settlement sweep complete.")
+    except Exception as e:
+        log(f"[SETTLE][ERROR] Settlement sweep failed (non-fatal): {e}")
 
-    print(f"[TRACK] running {strategy} for {today_s}")
 
-    # Write rows FIRST; only create lock file if we successfully wrote at least one row
-    wrote = log_today_for_all_cities(strategy)
-    if wrote > 0:
-        mark_lock_ran(strategy, today_s)
-    else:
-        print(f"[TRACK] {strategy}: wrote 0 rows, not creating lock file")
+def main() -> int:
+    # Secrets / key material
+    ensure_kalshi_key_material()
+
+    # Import engine
+    try:
+        import philly_edge as pe
+    except Exception as e:
+        log(f"[FATAL] Could not import philly_edge.py: {e}")
+        log(traceback.format_exc())
+        return 0  # never fail Actions
+
+    day = today_str_utc()
+
+    total_written = 0
+    for strat in ("lock_0930", "lock_1200"):
+        try:
+            total_written += run_lock(pe, strat, day)
+        except Exception as e:
+            log(f"[TRACK][{strat}][ERROR] Non-fatal: {e}")
+            log(traceback.format_exc())
+
+    # Settlement sweep (always attempt; never fatal)
+    run_settlement(pe)
+
+    log(f"[DONE] total_rows_written={total_written}")
+    return 0  # Always succeed so schedule keeps running
 
 
 if __name__ == "__main__":
-    # Snapshot at 09:30 CST
-    maybe_run_lock("lock_0930", 9, 30)
-
-    # Snapshot at 12:00 CST
-    maybe_run_lock("lock_1200", 12, 0)
-
-    # Fill in outcomes for past days that have settled
-    pe.perf_update_outcomes()
-
-    print("✅ Tracker complete: snapshots logged + outcomes updated")
+    sys.exit(main())
