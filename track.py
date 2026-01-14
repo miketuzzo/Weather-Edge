@@ -4,16 +4,13 @@ Weather Edge Tracker (GitHub Actions)
 
 Goals:
 - Run lock_0930 and lock_1200 picks (idempotent via lock files)
+- Backfill yesterday (CST) in case a scheduled run failed/missed
 - Run settlement sweep (update observed highs + wins) if available
 - Never crash the workflow (log errors; exit 0)
 - Support Kalshi auth via either:
     - KALSHI_PRIVATE_KEY_PEM (multiline)
     - KALSHI_PRIVATE_KEY_B64 (single-line base64)
     - KALSHI_PRIVATE_KEY_PATH (file path)
-
-Notes:
-- In GitHub Actions, secrets passed via env are strings; base64 is usually safest.
-- This script will decode B64 -> /tmp/kalshi.key and set KALSHI_PRIVATE_KEY_PATH for philly_edge.py
 """
 
 import os
@@ -21,8 +18,13 @@ import sys
 import csv
 import base64
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
+
+try:
+    from zoneinfo import ZoneInfo  # py3.9+
+except Exception:
+    ZoneInfo = None
 
 # -------------------------
 # Paths / constants
@@ -36,7 +38,6 @@ LOG_PATH = DATA_DIR / "cron_track.log"
 LOCK_DIR = DATA_DIR / "locks"
 LOCK_DIR.mkdir(exist_ok=True)
 
-# Canonical columns (match your current performance.csv shape)
 PERF_COLUMNS = [
     "date",
     "city",
@@ -69,90 +70,57 @@ def log(msg: str) -> None:
     except Exception:
         pass
 
-
-def today_str_utc() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
+def day_str_cst(offset_days: int = 0) -> str:
+    """
+    Use America/Chicago as the app's "business day".
+    Falls back to UTC if ZoneInfo isn't available (should be available on GH Actions).
+    """
+    if ZoneInfo is None:
+        d = datetime.now(timezone.utc) + timedelta(days=offset_days)
+        return d.strftime("%Y-%m-%d")
+    tz = ZoneInfo("America/Chicago")
+    d = datetime.now(tz) + timedelta(days=offset_days)
+    return d.strftime("%Y-%m-%d")
 
 def lock_file(strategy: str, day: str) -> Path:
     return LOCK_DIR / f"{day}_{strategy}.lock"
 
-
 def is_locked(strategy: str, day: str) -> bool:
     return lock_file(strategy, day).exists()
 
-
 def set_locked(strategy: str, day: str, detail: str = "") -> None:
-    lf = lock_file(strategy, day)
     try:
-        lf.write_text(detail or "ok", encoding="utf-8")
+        lock_file(strategy, day).write_text(detail or "ok", encoding="utf-8")
     except Exception:
         pass
-
 
 # -------------------------
 # Secrets handling
 # -------------------------
-def _clean_b64(s: str) -> str:
-    """Remove whitespace/newlines so base64 decoding works even if pasted with line breaks."""
-    return "".join((s or "").split())
-
-
-def _looks_like_pem(text: str) -> bool:
-    t = (text or "").strip()
-    return t.startswith("-----BEGIN") and "PRIVATE KEY" in t
-
-
-def has_kalshi_key_material() -> bool:
-    """Used to decide if settlement is safe to run."""
-    if os.getenv("KALSHI_PRIVATE_KEY_PATH", "").strip():
-        return True
-    if os.getenv("KALSHI_PRIVATE_KEY_PEM", "").strip():
-        return True
-    if os.getenv("KALSHI_PRIVATE_KEY_B64", "").strip():
-        return True
-    # Some people store PEM-as-base64 in KALSHI_PRIVATE_KEY_PEM by mistake
-    pem = os.getenv("KALSHI_PRIVATE_KEY_PEM", "")
-    if pem and _clean_b64(pem) and not _looks_like_pem(pem):
-        return True
-    return False
-
-
 def ensure_kalshi_key_material() -> None:
     """
     Ensures Kalshi key is available for philly_edge.py.
     Supports:
-      - KALSHI_PRIVATE_KEY_PEM (raw multiline PEM)
-      - KALSHI_PRIVATE_KEY_B64 (base64 of PEM bytes)  <-- recommended in Actions
-      - KALSHI_PRIVATE_KEY_PATH (file path)
-    Also handles the common mistake: KALSHI_PRIVATE_KEY_PEM accidentally contains base64.
+      - KALSHI_PRIVATE_KEY_PEM
+      - KALSHI_PRIVATE_KEY_B64  (preferred in Actions)
+      - KALSHI_PRIVATE_KEY_PATH
     """
     key_id = (os.getenv("KALSHI_KEY_ID") or os.getenv("KALSHI_API_KEY_ID") or "").strip()
-    pem = os.getenv("KALSHI_PRIVATE_KEY_PEM", "") or ""
-    b64 = os.getenv("KALSHI_PRIVATE_KEY_B64", "") or ""
+    pem = os.getenv("KALSHI_PRIVATE_KEY_PEM", "")
+    b64 = (os.getenv("KALSHI_PRIVATE_KEY_B64") or "").strip()
     key_path = (os.getenv("KALSHI_PRIVATE_KEY_PATH") or os.getenv("KALSHI_API_PRIVATE_KEY_PATH") or "").strip()
 
-    pem_stripped = pem.strip()
-    b64_clean = _clean_b64(b64)
+    log(f"[ENV] KEY_ID_SET={bool(key_id)} PEM_LEN={len(pem.strip())} B64_LEN={len(b64)} PATH_SET={bool(key_path)}")
 
-    log(
-        f"[ENV] KEY_ID_SET={bool(key_id)} "
-        f"PEM_LEN={len(pem_stripped)} B64_LEN={len(b64_clean)} PATH_SET={bool(key_path)}"
-    )
-
-    # If path already provided, nothing to do
     if key_path:
         return
-
-    # If PEM looks valid, leave it to philly_edge (it reads *_PEM)
-    if pem_stripped and _looks_like_pem(pem_stripped):
+    if pem.strip():
         return
 
-    # If B64 exists, decode it into a file and set *_PATH
-    if b64_clean:
+    if b64:
         tmp_key = Path("/tmp/kalshi.key")
         try:
-            raw = base64.b64decode(b64_clean.encode("utf-8"))
+            raw = base64.b64decode(b64.encode("utf-8"))
             tmp_key.write_bytes(raw)
             os.environ["KALSHI_PRIVATE_KEY_PATH"] = str(tmp_key)
             log(f"[ENV] Decoded KALSHI_PRIVATE_KEY_B64 -> {tmp_key} ({tmp_key.stat().st_size} bytes)")
@@ -160,23 +128,7 @@ def ensure_kalshi_key_material() -> None:
             log(f"[ENV][ERROR] Failed to decode KALSHI_PRIVATE_KEY_B64: {e}")
         return
 
-    # Common mistake: PEM env var contains base64 instead of PEM text
-    pem_b64_clean = _clean_b64(pem_stripped)
-    if pem_b64_clean and not _looks_like_pem(pem_stripped):
-        tmp_key = Path("/tmp/kalshi.key")
-        try:
-            raw = base64.b64decode(pem_b64_clean.encode("utf-8"))
-            tmp_key.write_bytes(raw)
-            os.environ["KALSHI_PRIVATE_KEY_PATH"] = str(tmp_key)
-            # Clear the PEM var so philly_edge doesn't try to parse base64 as PEM
-            os.environ.pop("KALSHI_PRIVATE_KEY_PEM", None)
-            log(f"[ENV] Decoded (PEM-as-B64) -> {tmp_key} ({tmp_key.stat().st_size} bytes)")
-        except Exception as e:
-            log(f"[ENV][ERROR] Failed to decode KALSHI_PRIVATE_KEY_PEM as base64: {e}")
-        return
-
     log("[ENV][WARN] No Kalshi private key material found (PEM/B64/PATH). Market calls may fail.")
-
 
 # -------------------------
 # CSV helpers
@@ -193,7 +145,6 @@ def write_rows_append(new_rows: list) -> int:
     for r in new_rows:
         if not isinstance(r, dict):
             continue
-        # remove None keys to avoid csv.DictWriter crash
         r = {k: v for k, v in r.items() if k is not None}
         out = {c: r.get(c, "") for c in PERF_COLUMNS}
         cleaned.append(out)
@@ -214,16 +165,10 @@ def write_rows_append(new_rows: list) -> int:
         log(f"[CSV][ERROR] Append failed: {e}")
         return 0
 
-
 # -------------------------
 # Main tracking logic
 # -------------------------
 def run_lock(pe, strategy: str, day: str) -> int:
-    """
-    Run one lock strategy (lock_0930 or lock_1200).
-    Tries multiple function names to match evolving philly_edge.py.
-    Returns number of rows appended.
-    """
     if is_locked(strategy, day):
         log(f"[TRACK] {strategy} already ran for {day} (lock exists). Skipping.")
         return 0
@@ -244,39 +189,31 @@ def run_lock(pe, strategy: str, day: str) -> int:
         if callable(fn):
             try:
                 out = fn(day=day, strategy=strategy)
-                if isinstance(out, list):
-                    new_rows = out
-                elif isinstance(out, tuple) and out and isinstance(out[0], list):
-                    new_rows = out[0]
-                else:
-                    new_rows = []
-                break
             except TypeError:
-                try:
-                    out = fn(day, strategy)
-                    if isinstance(out, list):
-                        new_rows = out
-                    elif isinstance(out, tuple) and out and isinstance(out[0], list):
-                        new_rows = out[0]
-                    else:
-                        new_rows = []
-                    break
-                except Exception as e:
-                    log(f"[TRACK][{strategy}] {fname} failed: {e}")
-            except Exception as e:
-                log(f"[TRACK][{strategy}] {fname} failed: {e}")
+                out = fn(day, strategy)
 
-    # Fallback: compute per-city if no high-level fn exists
+            if isinstance(out, list):
+                new_rows = out
+            elif isinstance(out, tuple) and out and isinstance(out[0], list):
+                new_rows = out[0]
+            else:
+                new_rows = []
+            break
+
     if not new_rows:
         cities = getattr(pe, "CITIES", None) or ["Philadelphia", "Los Angeles", "Denver", "Miami", "NYC", "Chicago", "Austin"]
-
         compute_fn = getattr(pe, "compute_pick_for_today", None) or getattr(pe, "compute_pick", None)
+
         if not callable(compute_fn):
             log(f"[TRACK][{strategy}] No compute function found in philly_edge.py (expected compute_pick_for_today).")
         else:
             for city in cities:
                 try:
-                    result = compute_fn(city=city, strategy=strategy)
+                    try:
+                        result = compute_fn(city=city, strategy=strategy)
+                    except TypeError:
+                        result = compute_fn(city, strategy)
+
                     row = None
                     if isinstance(result, dict):
                         row = result
@@ -285,6 +222,7 @@ def run_lock(pe, strategy: str, day: str) -> int:
                             if isinstance(item, dict):
                                 row = item
                                 break
+
                     if row:
                         row.setdefault("strategy", strategy)
                         row.setdefault("date", day)
@@ -302,58 +240,45 @@ def run_lock(pe, strategy: str, day: str) -> int:
 
     return wrote
 
-
 def run_settlement(pe) -> None:
-    """
-    Settlement sweep: update outcomes using NOAA/NWS observed highs.
-    Hard-wrapped so workflow never fails.
-    """
     fn = getattr(pe, "perf_update_outcomes", None) or getattr(pe, "update_outcomes", None)
     if not callable(fn):
         log("[SETTLE] No settlement function found (perf_update_outcomes). Skipping.")
         return
-
     try:
         log("[SETTLE] Starting settlement sweep...")
         fn()
         log("[SETTLE] Settlement sweep complete.")
     except Exception as e:
         log(f"[SETTLE][ERROR] Settlement sweep failed (non-fatal): {e}")
-        log(traceback.format_exc())
-
 
 def main() -> int:
-    # Ensure key material is wired for philly_edge
     ensure_kalshi_key_material()
 
-    # Import engine
     try:
         import philly_edge as pe
     except Exception as e:
         log(f"[FATAL] Could not import philly_edge.py: {e}")
         log(traceback.format_exc())
-        return 0  # never fail Actions
+        return 0
 
-    day = today_str_utc()
+    # Always attempt yesterday + today in CST (backfill safety)
+    days = [day_str_cst(-1), day_str_cst(0)]
+    strategies = ("lock_0930", "lock_1200")
 
     total_written = 0
-    for strat in ("lock_0930", "lock_1200"):
-        try:
-            total_written += run_lock(pe, strat, day)
-        except Exception as e:
-            log(f"[TRACK][{strat}][ERROR] Non-fatal: {e}")
-            log(traceback.format_exc())
+    for day in days:
+        for strat in strategies:
+            try:
+                total_written += run_lock(pe, strat, day)
+            except Exception as e:
+                log(f"[TRACK][{strat}][{day}][ERROR] Non-fatal: {e}")
+                log(traceback.format_exc())
 
-    # IMPORTANT: only run settlement if we actually have key material.
-    # This avoids crashes inside pe.perf_update_outcomes() during "missing key" runs.
-    if has_kalshi_key_material():
-        run_settlement(pe)
-    else:
-        log("[SETTLE] Skipping settlement sweep (no Kalshi key material present).")
+    run_settlement(pe)
 
-    log(f"[DONE] total_rows_written={total_written}")
-    return 0  # Always succeed so schedule keeps running
-
+    log(f"[DONE] total_rows_written={total_written} days={days}")
+    return 0
 
 if __name__ == "__main__":
     sys.exit(main())
