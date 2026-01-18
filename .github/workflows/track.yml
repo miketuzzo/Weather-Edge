@@ -54,7 +54,7 @@ jobs:
           # KALSHI_PRIVATE_KEY_PATH: ${{ secrets.KALSHI_PRIVATE_KEY_PATH }}
         run: |
           python -c "import os; print('KEY_ID_SET=', bool(os.getenv('KALSHI_KEY_ID'))); print('PEM_LEN=', len(os.getenv('KALSHI_PRIVATE_KEY_PEM','').strip())); print('B64_LEN=', len(os.getenv('KALSHI_PRIVATE_KEY_B64','').strip()))"
-          python track.py || true
+          python track.py
 
       - name: Commit updated performance data
         run: |
