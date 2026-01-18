@@ -18,6 +18,14 @@ import json
 import re
 from typing import Optional
 
+# --- Stable paths (works locally + on Streamlit Cloud) ---
+from pathlib import Path
+APP_ROOT = Path(__file__).resolve().parent
+DATA_DIR = APP_ROOT / "data"
+DATA_DIR.mkdir(exist_ok=True)
+PERF_PATH = DATA_DIR / "performance.csv"
+LOG_PATH = DATA_DIR / "cron_track.log"
+
 # --- Deploy check (confirms Streamlit redeployed your latest push) ---
 ET_TZ = ZoneInfo("America/New_York")
 
@@ -774,8 +782,8 @@ with st.sidebar:
     show_only_viable = st.checkbox("Hide locked/not viable", value=False)
     show_debug = st.checkbox("Show diagnostics", value=False)
 
-    # Path to local performance log
-    perf_path = os.path.join("data", "performance.csv")
+    # Repo-relative path so Streamlit Cloud can always find history
+    perf_path = str(PERF_PATH)
 
 #
 # Global strategy used by snapshot/model calls
@@ -1404,19 +1412,197 @@ except Exception as e:
 # -----------------------
 # Historical performance (if available)
 # -----------------------
+
+# -----------------------
+# CSV safety / repair helpers (local + deployed)
+# -----------------------
+
+import csv
+import re
+
+def _repair_perf_row(fields: list, n_expected: int) -> list:
+    """Repair a row with the wrong field count by assuming the extra columns
+    belong to `labels_json` (column index 4). This fixes cases where JSON wasn't
+    properly quoted and got split by commas.
+
+    Expected columns (n_expected) match PERF_COLUMNS in track.py:
+    date, city, station, sigma_f, labels_json, best_contract, yes_ask_prob,
+    model_prob, value_prob, observed_high_f, winning_contract, won, profit,
+    computed_winning, computed_won, strategy
+    """
+    if fields is None:
+        return [""] * n_expected
+
+    # Too few fields -> pad
+    if len(fields) < n_expected:
+        return fields + ([""] * (n_expected - len(fields)))
+
+    # Exact -> ok
+    if len(fields) == n_expected:
+        return fields
+
+    # Too many -> merge the extra pieces into labels_json (index 4)
+    # labels_json is the 5th column (0-based index 4)
+    extras = len(fields) - n_expected
+    # Merge fields[4 : 5+extras] into one comma-joined labels_json
+    merged_labels = ",".join(fields[4:5 + extras])
+    repaired = fields[:4] + [merged_labels] + fields[5 + extras:]
+
+    # If still off, hard-trim/pad defensively
+    if len(repaired) > n_expected:
+        repaired = repaired[:n_expected]
+    if len(repaired) < n_expected:
+        repaired = repaired + ([""] * (n_expected - len(repaired)))
+    return repaired
+
+
+def safe_load_performance_csv(path: Path):
+    """Load performance.csv even if 1+ lines are malformed.
+
+    Returns: (df, info_dict)
+      info_dict = {
+        'expected_fields': int,
+        'bad_line_count': int,
+        'bad_lines': list of (lineno, field_count, preview)
+        'repaired': bool
+      }
+    """
+    info = {
+        "expected_fields": 0,
+        "bad_line_count": 0,
+        "bad_lines": [],
+        "repaired": False,
+    }
+
+    if path is None or (not Path(path).exists()):
+        return pd.DataFrame(), info
+
+    # First try: normal pandas read
+    try:
+        df0 = pd.read_csv(path)
+        info["expected_fields"] = len(df0.columns)
+        return df0, info
+    except Exception:
+        pass
+
+    # Fallback: repair line-by-line
+    try:
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            reader = csv.reader(f)
+            rows = list(reader)
+
+        if not rows:
+            return pd.DataFrame(), info
+
+        header = rows[0]
+        n_expected = len(header)
+        info["expected_fields"] = n_expected
+
+        fixed_rows = [header]
+        for i, r in enumerate(rows[1:], start=2):  # 1-based line numbers; header is line 1
+            if r is None:
+                continue
+            if len(r) != n_expected:
+                info["bad_line_count"] += 1
+                preview = ",".join(r)[:220]
+                info["bad_lines"].append((i, len(r), preview))
+                r = _repair_perf_row(r, n_expected)
+                info["repaired"] = True
+            fixed_rows.append(r)
+
+        df = pd.DataFrame(fixed_rows[1:], columns=fixed_rows[0])
+        return df, info
+    except Exception as e:
+        # Last resort: attempt python engine + skipping bad lines
+        try:
+            df1 = pd.read_csv(path, engine="python", on_bad_lines="skip")
+            info["expected_fields"] = len(df1.columns)
+            info["repaired"] = True
+            return df1, info
+        except Exception:
+            st.error(f"Failed to load performance history: {e}")
+            return pd.DataFrame(), info
+
+
+def try_repair_performance_csv_in_place(path: Path) -> str:
+    """Local-only helper: rewrite a cleaned CSV to disk (keeps a backup).
+    Returns a status message.
+    """
+    try:
+        p = Path(path)
+        if not p.exists():
+            return "No performance.csv found to repair."
+
+        df, info = safe_load_performance_csv(p)
+        if df.empty:
+            return "Repair attempted, but resulting table is empty."
+
+        backup = p.with_suffix(p.suffix + ".bak")
+        # Avoid overwriting an existing backup repeatedly
+        if not backup.exists():
+            backup.write_bytes(p.read_bytes())
+
+        df.to_csv(p, index=False)
+        return f"Rewrote performance.csv (backup: {backup.name}). Bad lines detected: {info['bad_line_count']}"
+    except Exception as e:
+        return f"Repair failed: {e}"
+
 if hasattr(pe, "perf_load_df"):
     st.subheader("Historical performance")
-    if not os.path.exists(perf_path):
+    # --- History file diagnostics (helps when live shows "no history") ---
+    with st.expander("📁 History file status", expanded=False):
+        st.write("PERF_PATH:", str(PERF_PATH))
+        st.write("Exists:", PERF_PATH.exists())
+        if PERF_PATH.exists():
+            try:
+                st.write("Size (bytes):", PERF_PATH.stat().st_size)
+                # show header + first 3 rows for sanity
+                _tmp = pd.read_csv(PERF_PATH).head(3)
+                st.dataframe(_tmp, width="stretch", hide_index=True)
+            except Exception as _e:
+                st.write("Preview failed:", str(_e))
+
+            # Also show a safe-load diagnostics report
+            _df_safe, _info = safe_load_performance_csv(PERF_PATH)
+            if _info.get("bad_line_count", 0) > 0:
+                st.write("Malformed line(s) detected:", _info["bad_line_count"])
+                st.write("First few bad lines (line_no, field_count, preview):")
+                st.write(_info["bad_lines"][:5])
+
+                if st.button("🛠 Repair performance.csv (local)"):
+                    msg = try_repair_performance_csv_in_place(PERF_PATH)
+                    st.success(msg)
+                    st.cache_data.clear()
+                    st.rerun()
+            else:
+                st.write("CSV looks structurally OK (no malformed lines detected).")
+
+    if not PERF_PATH.exists():
         st.info(
-            "No performance.csv found on this server, so there’s no history to show. "
-            "Your local tracker writes to data/performance.csv on your machine; the live site won’t see that file unless you "
-            "persist it (e.g., commit it, upload it to storage, or run tracking on the server)."
+            "No performance.csv found in the deployed repo (`data/performance.csv`), so there’s no history to show. "
+            "If GitHub Actions is green, make sure the workflow is committing `data/performance.csv` to `main`."
         )
-    try:
-        perf = pe.perf_load_df()
-    except Exception as e:
-        st.error(f"Failed to load performance history: {e}")
         perf = pd.DataFrame()
+    else:
+        # Try the engine helper first (keeps schema consistent), but fall back
+        # to a safe loader that can repair malformed CSV rows.
+        try:
+            perf = pe.perf_load_df()
+        except Exception as e:
+            perf, info = safe_load_performance_csv(PERF_PATH)
+            if info.get("bad_line_count", 0) > 0:
+                st.warning(
+                    f"performance.csv had {info['bad_line_count']} malformed line(s). "
+                    "Loaded with automatic repair so history can render. "
+                    "Open the History file status expander to see details."
+                )
+            else:
+                st.warning(f"perf_load_df() failed; loaded CSV directly: {e}")
+
+        # If pe.perf_load_df() succeeded but pandas would fail later due to bad CSV,
+        # we still keep a diagnostics view via the safe loader.
+        if "perf" not in locals() or perf is None:
+            perf, _ = safe_load_performance_csv(PERF_PATH)
     # Treat a row as "settled" if we have an observed high. Profit may legitimately be NaN
     # (e.g., price/fee not captured, or older rows), so don't drop rows on profit.
     perf = perf.copy()
@@ -1543,14 +1729,19 @@ if hasattr(pe, "perf_load_df"):
             df["winning_contract"] = comp.where(comp.notna(), df.get("winning_contract"))
 
         # Recompute win flag from best_contract vs winner.
-        # IMPORTANT: If we don't know the winning contract yet (missing labels/highs), keep won as NA
-        # so the row is not counted as a settled bet.
+        # IMPORTANT: Only mark a bet as settled if we have an observed high AND we can identify the winning bucket.
         if "best_contract" in df.columns:
-            bc = df["best_contract"].astype(str)
-            wc = df["winning_contract"].astype(str)
-            known = pd.to_numeric(df.get("observed_high_f"), errors="coerce").notna() & df["winning_contract"].notna() & df["best_contract"].notna()
+            # Only mark a bet as settled if we have an observed high AND we can identify the winning bucket.
+            obs_ok = pd.to_numeric(df.get("observed_high_f"), errors="coerce").notna()
+            wc_ok = df.get("winning_contract").notna()
+            bc_ok = df.get("best_contract").notna()
+            known = obs_ok & wc_ok & bc_ok
+
             df["won"] = pd.NA
-            df.loc[known, "won"] = (bc[known] == wc[known]).astype(float)
+            # Compare as strings but do NOT coerce NaNs to the literal string "nan".
+            bc = df.loc[known, "best_contract"].astype(str)
+            wc = df.loc[known, "winning_contract"].astype(str)
+            df.loc[known, "won"] = (bc == wc).astype(float)
 
         # Recompute profit only for settled rows where we know won and price.
         # Profit per $1 YES contract: win => (1 - price), lose => (-price)
@@ -1651,9 +1842,23 @@ if hasattr(pe, "perf_load_df"):
             "Use the drilldown below to see the exact pick vs. actual winning bucket (green = win, red = loss)."
         )
 
+        # Dedupe settled rows so a city only counts once per date/strategy
+        done_dedup = done.copy()
+        if all(c in done_dedup.columns for c in ["date", "strategy", "city"]):
+            # keep the last occurrence for a city/date/strategy
+            done_dedup = (
+                done_dedup
+                .sort_values(["date", "strategy"], ascending=[False, True])
+                .drop_duplicates(["date", "strategy", "city"], keep="last")
+            )
+
+        # Aggregate only on rows where the win/loss is known (prevents unknown winners from showing as 0/7).
+        _won_num = pd.to_numeric(done_dedup.get("won"), errors="coerce")
+        known_mask = _won_num.notna()
         daily = (
-            done.groupby(["date", "strategy"], as_index=False)
-                .agg(bets=("won", "count"), wins=("won", "sum"))
+            done_dedup.loc[known_mask]
+            .groupby(["date", "strategy"], as_index=False)
+            .agg(bets=("city", "nunique"), wins=("won", "sum"))
         )
 
         # Include dates that have lock rows but are not settled yet (so we can show the ⏳ pending state)
@@ -1676,26 +1881,33 @@ if hasattr(pe, "perf_load_df"):
             return (w, b)
 
         def _lock_state(date_s: str, strat: str):
-            """Return (has_lock_rows, has_any_settled, n_lock_rows) for a date/strategy."""
+            """Return (has_lock_rows, all_settled, n_cities) for a date/strategy."""
             sub_all = perf[(perf["date"].astype(str) == str(date_s)) & (perf["strategy"] == strat)].copy()
             if sub_all.empty:
                 return (False, False, 0)
+
+            # Count unique cities for the bet count
+            n_cities = int(sub_all["city"].nunique()) if "city" in sub_all.columns else int(len(sub_all))
+
             obs_all = pd.to_numeric(sub_all.get("observed_high_f"), errors="coerce")
-            return (True, bool(obs_all.notna().any()), int(len(sub_all)))
+            won_all = pd.to_numeric(sub_all.get("won"), errors="coerce")
+            # Fully settled only if every row has an observed high AND a computed win/loss.
+            all_settled = bool(len(sub_all) > 0 and obs_all.notna().all() and won_all.notna().all())
+            return (True, all_settled, n_cities)
 
         for d in dates[:30]:
             w0930, b0930 = _wl_tuple(d, "lock_0930")
             w1200, b1200 = _wl_tuple(d, "lock_1200")
-            has0930, settled0930, n0930 = _lock_state(d, "lock_0930")
-            has1200, settled1200, n1200 = _lock_state(d, "lock_1200")
+            has0930, all_settled0930, n0930 = _lock_state(d, "lock_0930")
+            has1200, all_settled1200, n1200 = _lock_state(d, "lock_1200")
 
-            p0930 = bool(has0930 and not settled0930)
-            p1200 = bool(has1200 and not settled1200)
+            p0930 = bool(has0930 and not all_settled0930)
+            p1200 = bool(has1200 and not all_settled1200)
 
-            # If we have lock rows but nothing settled yet, show as pending and set bet count to the number of rows (usually 7)
-            if p0930:
+            # Use unique-city counts for the denominator when pending or when settled rows are sparse
+            if has0930:
                 b0930 = n0930 if n0930 else (b0930 if b0930 else 7)
-            if p1200:
+            if has1200:
                 b1200 = n1200 if n1200 else (b1200 if b1200 else 7)
 
             # If we truly have no rows, keep b=0 so the card can say "No records"
@@ -1718,7 +1930,7 @@ if hasattr(pe, "perf_load_df"):
                     <div style=\"padding:12px 14px;border-radius:14px;border:1px solid rgba(255,255,255,0.10);background:{badge};\">
                       <div style=\"font-size:13px;opacity:0.85;margin-bottom:6px;\">{title}</div>
                       <div style="font-size:28px;font-weight:800;line-height:1;">{('—' if pending else str(w))}/{(b if b else 7)}</div>
-                      <div style="font-size:12px;opacity:0.8;margin-top:6px;">{('⏳ Waiting for official highs' if pending else ('Settled' if b > 0 else 'No records'))}</div>
+                      <div style="font-size:12px;opacity:0.8;margin-top:6px;">{('⏳ Waiting for settlement (highs/winner)' if pending else ('Settled' if b > 0 else 'No records'))}</div>
                     </div>
                     """,
                     unsafe_allow_html=True,
@@ -1739,6 +1951,9 @@ if hasattr(pe, "perf_load_df"):
         )
         dates_any = sorted(dates_any, reverse=True)
 
+        if perf.empty:
+            st.info("No history rows loaded yet.")
+            st.stop()
         if dates_any:
             drill_date = st.selectbox("Date", options=dates_any, index=0, key="drill_date")
             drill_lock = st.selectbox("Lock time", options=["09:30 CST", "12:00 CST"], index=0, key="drill_lock")
@@ -1746,23 +1961,38 @@ if hasattr(pe, "perf_load_df"):
 
             # Pull from perf (all rows), and then display settlement if available
             ddf_all = perf[(perf["date"].astype(str) == str(drill_date)) & (perf["strategy"] == drill_strat)].copy()
+            # Dedupe raw rows by city so the drilldown is always 1 row per city
+            if not ddf_all.empty and all(c in ddf_all.columns for c in ["city", "date", "strategy"]):
+                ddf_all = ddf_all.drop_duplicates(["date", "strategy", "city"], keep="last")
 
             if ddf_all.empty:
                 st.info("No records for that date/lock yet.")
             else:
                 # Prefer the settled/enriched version when available (done), but keep pending rows
                 ddf_done = done[(done["date"].astype(str) == str(drill_date)) & (done["strategy"] == drill_strat)].copy()
+                if not ddf_done.empty and all(c in ddf_done.columns for c in ["city", "date", "strategy"]):
+                    ddf_done = ddf_done.drop_duplicates(["date", "strategy", "city"], keep="last")
 
                 ddf = ddf_all.copy()
                 if not ddf_done.empty:
                     # overlay settlement columns onto the base rows by city
                     for col in ["observed_high_f", "winning_contract", "won", "profit"]:
                         if col in ddf_done.columns:
-                            m = dict(zip(ddf_done.get("city"), ddf_done.get(col)))
+                            # Build a SAFE city -> value mapping (dedupe cities to avoid pandas InvalidIndexError)
+                            tmp = ddf_done[["city", col]].copy()
+                            tmp["city"] = tmp["city"].astype(str).str.strip()
+                            tmp = tmp.dropna(subset=["city"])
+                            tmp = tmp.drop_duplicates(subset=["city"], keep="last")
+
+                            m = dict(zip(tmp["city"], tmp[col]))
+
                             if col not in ddf.columns:
                                 ddf[col] = pd.NA
-                            mapped = ddf["city"].map(m)
-                            ddf[col] = mapped.where(mapped.notna(), ddf.get(col))
+
+                            ddf["_city_key"] = ddf["city"].astype(str).str.strip()
+                            mapped = ddf["_city_key"].map(m)
+                            ddf[col] = mapped.where(mapped.notna(), ddf[col])
+                            ddf = ddf.drop(columns=["_city_key"])
 
                 show = ddf[[c for c in ["city", "best_contract", "winning_contract", "observed_high_f", "won"] if c in ddf.columns]].copy()
                 show = show.rename(columns={
@@ -1873,7 +2103,6 @@ if hasattr(pe, "perf_load_df"):
         def _render_city_panel(df_in: pd.DataFrame, label: str):
             if df_in.empty:
                 st.info("No settled rows for this view yet.")
-                return
 
             summ = _city_summary(df_in)
             st.dataframe(_style_city(summ), width="stretch", hide_index=True)
